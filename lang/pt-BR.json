@@ -1,0 +1,15 @@
+{
+  "YTJ.Title": "Jukebox YouTube",
+  "YTJ.Placeholder": "Cole um link de vídeo ou playlist do YouTube…",
+  "YTJ.EnableAudio": "Ativar Áudio",
+  "YTJ.Load": "Carregar",
+  "YTJ.Previous": "Anterior",
+  "YTJ.Play": "Tocar",
+  "YTJ.Pause": "Pausar",
+  "YTJ.Stop": "Parar",
+  "YTJ.Next": "Próxima",
+  "YTJ.Sync": "Sincronizar",
+  "YTJ.None": "Nenhum item. Carregue um link de vídeo/playlist.",
+  "YTJ.Tip": "Dica: clique num item para selecionar; use os botões para tocar/pausar/parar.",
+  "YTJ.Volume": "Vol:"
+}

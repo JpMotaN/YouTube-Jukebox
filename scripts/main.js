@@ -1,0 +1,811 @@
+/**
+ * YouTube Jukebox – main.js v0.1.0
+ * - Overlay improvements kept (Pause OL + per-client Overlay volume in FAB popover)
+ * - Removed duplicate overlay volume from control bar (only in FAB popover now)
+ * - Draggable FAB (per-client position persists). Volume popover follows the FAB.
+ * - Configurable keybinding (default Ctrl/Cmd + K) via Foundry's Keybindings UI
+ */
+
+const YTJ_ID = "yt-jukebox";
+const YTJ_CH = `module.${YTJ_ID}`;
+
+/* ------------------------------- Settings ------------------------------- */
+Hooks.once("init", () => {
+  game.settings.register(YTJ_ID, "controller", {
+    name: "Who can control",
+    hint: "Who may send play/pause/next commands to everyone.",
+    scope: "world", config: true, type: String,
+    choices: { gm: "GM only", all: "Everyone" }, default: "all"
+  });
+
+  game.settings.register(YTJ_ID, "apiKey", {
+    name: "YouTube API Key (optional)",
+    hint: "Used to fetch playlist titles. Without it, titles fallback to noembed.com.",
+    scope: "world", config: true, type: String, default: ""
+  });
+
+  game.settings.register(YTJ_ID, "library", {
+    name: "Library (do not edit manually)",
+    scope: "world", config: false, type: Object, default: { groups: [] }
+  });
+
+  game.settings.register(YTJ_ID, "clientVol", {
+    name: "Client Volume (Main)",
+    scope: "client", config: false, type: Number, default: 40
+  });
+
+  game.settings.register(YTJ_ID, "clientVolOverlay", {
+    name: "Client Volume (Overlay)",
+    scope: "client", config: false, type: Number, default: 40
+  });
+
+  // Client-persistent FAB position
+  game.settings.register(YTJ_ID, "fabPos", {
+    name: "FAB Position",
+    scope: "client", config: false, type: Object, default: { top: 10, left: 56 }
+  });
+
+  // Keybinding (configurable in Foundry's Keybindings UI)
+  game.keybindings.register(YTJ_ID, "toggleUI", {
+    name: "Toggle YouTube Jukebox",
+    hint: "Open/close the YouTube Jukebox panel.",
+    editable: [{ key: "KeyK", modifiers: ["CONTROL"] }], // Ctrl/Cmd+K (Cmd works on Mac automatically)
+    onDown: () => { YTJ_App.toggle(); return true; },
+    restricted: false,
+    precedence: CONST.KEYBINDING_PRECEDENCE.NORMAL
+  });
+});
+
+Hooks.once("ready", () => {
+  YTJ_Library.load();
+  game.socket.on(YTJ_CH, YTJ_Socket.onMessage);
+
+  const mod = game.modules.get(YTJ_ID);
+  if (mod) mod.api = {
+    open: () => YTJ_App.toggle(true),
+    close: () => YTJ_App.close(),
+    toggle: () => YTJ_App.toggle(),
+    play: (videoId) => { const pos = YTJ_Library.findVideo(videoId); if (pos) YTJ_Control.playAt(pos.g, pos.i); },
+    setVolume: (v) => { YTJ_Player.setVolume(v); },
+    setOverlayVolume: (v) => { YTJ_Player.setVolumeBg(v); }
+  };
+
+  YTJ_UI.createFabWithVolume();
+});
+
+/* ------------------------------- State ------------------------------- */
+const YTJ_State = {
+  // main
+  g: -1, i: -1,
+  selG: -1, selI: -1,
+  paused: false, pausedTime: 0, stopped: true,
+  // overlay
+  bgG: -1, bgI: -1,
+  bgPaused: false, bgPausedTime: 0, bgActive: false,
+
+  controller: () => (game.settings.get(YTJ_ID, "controller") !== "gm" || game.user?.isGM),
+  canEditLibrary: () => !!game.user?.isGM,
+  renamePendingGroupId: null
+};
+
+/* ------------------------------- Socket ------------------------------- */
+const YTJ_Socket = {
+  emit(p){ game.socket.emit(YTJ_CH, p); },
+  onMessage(p){
+    if (!p || !p.cmd) return;
+    switch (p.cmd) {
+      // library sync
+      case "lib-set": YTJ_Library.applyRemote(p.lib); break;
+
+      // main player
+      case "play": (async()=>{ const {id,g,i,t}=p; await YTJ_Player.play(id,t); YTJ_State.g=g; YTJ_State.i=i; YTJ_State.paused=false; YTJ_State.stopped=false; if(YTJ_State.selG<0){YTJ_State.selG=g;YTJ_State.selI=i;} YTJ_UI.refresh(); })(); break;
+      case "pause": (async()=>{ await YTJ_Player.pauseAt(p.t); YTJ_State.paused=true; YTJ_State.pausedTime=p.t ?? YTJ_Player.time; })(); break;
+      case "stop": (async()=>{ await YTJ_Player.hardStop(); YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true; })(); break;
+      case "seek": (async()=>{ await YTJ_Player.seek(p.t); })(); break;
+
+      // overlay player
+      case "playBg": (async()=>{ const {id,g,i,t}=p; await YTJ_Player.playBg(id,t); YTJ_State.bgG=g; YTJ_State.bgI=i; YTJ_State.bgPaused=false; YTJ_State.bgActive=true; YTJ_UI.refresh(); })(); break;
+      case "pauseBg": (async()=>{ await YTJ_Player.pauseBgAt(p.t); YTJ_State.bgPaused=true; YTJ_State.bgPausedTime=p.t ?? YTJ_Player.timeBg; YTJ_UI.refresh(); })(); break;
+      case "stopBg": (async()=>{ await YTJ_Player.hardStopBg(); YTJ_State.bgPaused=false; YTJ_State.bgPausedTime=0; YTJ_State.bgActive=false; YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_UI.refresh(); })(); break;
+      case "seekBg": (async()=>{ await YTJ_Player.seekBg(p.t); })(); break;
+    }
+  }
+};
+
+/* ------------------------------- Library ------------------------------- */
+const YTJ_Library = {
+  data: { groups: [] },
+
+  load(){
+    try { this.data = this._ensureDefaults(game.settings.get(YTJ_ID,"library")||{groups:[]}); }
+    catch { this.data = this._ensureDefaults({groups:[]}); }
+  },
+
+  async save(broadcast=true){
+    if (!YTJ_State.canEditLibrary()) return;
+    await game.settings.set(YTJ_ID,"library", this.data);
+    if (broadcast) YTJ_Socket.emit({ cmd:"lib-set", lib:this.data });
+  },
+
+  applyRemote(lib){
+    if (!lib || !lib.groups) return;
+    this.data = this._ensureDefaults(lib);
+    const g = this.data.groups[YTJ_State.selG];
+    if (!g) { YTJ_State.selG=-1; YTJ_State.selI=-1; }
+    else if (YTJ_State.selI >= g.items.length) { YTJ_State.selI = g.items.length-1; if (YTJ_State.selI<0) { YTJ_State.selG=-1; } }
+    YTJ_UI.refresh();
+  },
+
+  _ensureDefaults(obj){
+    const out = { groups: Array.isArray(obj.groups) ? obj.groups.slice() : [] };
+    if (!out.groups.length) out.groups.push({ id:"unsorted", name:"Unsorted", collapsed:false, items:[] });
+    return out;
+  },
+
+  groupIndexById(id){ return this.data.groups.findIndex(g=>g.id===id); },
+  createGroup(name, items=[]){ const g={ id:`g_${randomId(8)}`, name:name||"New Playlist", collapsed:false, items:items.slice() }; this.data.groups.push(g); return this.data.groups.length-1; },
+  deleteGroup(gi){ const g=this.data.groups[gi]; if (!g) return; this.data.groups.splice(gi,1); },
+  renameGroup(gi, name){ const g=this.data.groups[gi]; if(!g) return; g.name = String(name||"").trim() || g.name; },
+  toggleCollapsed(gi){ const g=this.data.groups[gi]; if(!g) return; g.collapsed=!g.collapsed; },
+
+  addItemTo(gi, item){ const g=this.data.groups[gi]; if(!g||!item?.id) return; if(!g.items.some(x=>x.id===item.id)) g.items.push({ id:item.id, title:item.title||item.id }); },
+  deleteItem(gi, ii){ const g=this.data.groups[gi]; if(!g) return; g.items.splice(ii,1); },
+
+  moveItem(fromG, fromI, toG){
+    if (fromG===toG) return;
+    const gFrom = this.data.groups[fromG], gTo = this.data.groups[toG];
+    if (!gFrom || !gTo) return;
+    const it = gFrom.items[fromI]; if (!it) return;
+    gFrom.items.splice(fromI,1);
+    if (!gTo.items.some(x=>x.id===it.id)) gTo.items.push(it);
+  },
+
+  nextPos(g,i){
+    const G=this.data.groups;
+    if (G[g] && i+1 < G[g].items.length) return { g, i:i+1 };
+    for (let gi=g+1; gi<G.length; gi++) if (G[gi].items.length) return { g:gi, i:0 };
+    return null;
+  },
+  prevPos(g,i){
+    const G=this.data.groups;
+    if (i-1 >= 0) return { g, i:i-1 };
+    for (let gi=g-1; gi>=0; gi--) { const len=G[gi].items.length; if (len) return { g:gi, i:len-1 }; }
+    return null;
+  },
+  getItem(g,i){ const grp=this.data.groups[g]; return grp? grp.items[i]||null : null; },
+  firstPos(){ const G=this.data.groups; for (let gi=0; gi<G.length; gi++) if (G[gi].items.length) return { g:gi, i:0 }; return { g:-1, i:-1 }; },
+  findVideo(id){ const G=this.data.groups; for (let gi=0; gi<G.length; gi++){ const ii = G[gi].items.findIndex(x=>x.id===id); if (ii>=0) return { g:gi, i:ii }; } return null; }
+};
+
+/* ------------------------------- Player (2 instances) ------------------------------- */
+const YTJ_Player = {
+  _mounted:false, _player:null, _readyPromise:null, _readyResolve:null,
+  _mountedBg:false, _playerBg:null, _readyPromiseBg:null, _readyResolveBg:null,
+
+  /* ---------- main ---------- */
+  async mountOnce(){ if(this._mounted) return; this._mounted=true; this._ensureHost(); await this._loadAPI(); this._create(); await this.ready(); },
+  _ensureHost(){
+    let host=document.getElementById("ytj-player");
+    if(!host){ host=document.createElement("div"); host.id="ytj-player"; host.setAttribute("aria-label","YouTube player");
+      Object.assign(host.style,{ position:"fixed", right:"8px", bottom:"8px", width:"1px", height:"1px", border:"0", background:"#000", borderRadius:"2px", zIndex:"4000" });
+      document.body.appendChild(host);
+    }
+  },
+  _loadAPI(){ if (window.YT?.Player) return Promise.resolve(); return new Promise(res=>{ const s=document.createElement("script"); s.src="https://www.youtube.com/iframe_api"; window.onYouTubeIframeAPIReady=()=>res(); document.head.appendChild(s); }); },
+  _create(){
+    const playerVars={ playsinline:1 }; if (location.protocol==="https:") playerVars.origin = location.origin;
+    this._readyPromise = new Promise(r=>this._readyResolve=r);
+    this._player = new YT.Player("ytj-player", {
+      height:"1", width:"1", playerVars,
+      events:{
+        onReady:()=>{ try{ this._player.setVolume(clamp0to100(Number(game.settings.get(YTJ_ID,"clientVol"))||40)); }catch{} this._readyResolve?.(true); },
+        onError:(e)=>{ const c=Number(e?.data); const msg=(c===2)?"Invalid parameter." : (c===5)?"Playback error in browser." : (c===100)?"Video not found." : (c===101||c===150)?"Embedding disabled by owner." : "YouTube player failure."; ui.notifications?.error(`YouTube: ${msg}`); console.error("[ytj] YT onError", e?.data); },
+        onStateChange:(ev)=>{ try{ if(ev?.data===YT.PlayerState.ENDED) YTJ_Control._onEnded(); }catch{} }
+      }
+    });
+  },
+  async ready(){ if(!this._readyPromise) return true; try{ await this._readyPromise; }catch{} return true; },
+  async ensure(){ const host=document.getElementById("ytj-player"); if(!host){ this._mounted=false; this._player=null; this._readyPromise=null; this._readyResolve=null; } await this.mountOnce(); await this.ready(); },
+
+  async play(videoId, startedAt){
+    await this.ensure();
+    const start = startedAt ? Math.max(0,(Date.now()-startedAt)/1000) : 0;
+    try{
+      this._player.loadVideoById(videoId, start);
+      setTimeout(()=>{ try{ this._player.playVideo(); }catch{} },50);
+      setTimeout(()=>{ try{
+        const vd=this._player.getVideoData?.()||{};
+        if(vd.title){ const pos = YTJ_Library.findVideo(videoId); if(pos){ const item = YTJ_Library.getItem(pos.g,pos.i); if(item && (!item.title || item.title===item.id)){ item.title = vd.title; if(YTJ_State.canEditLibrary()) YTJ_Library.save(true); YTJ_UI.refresh(); } } }
+      }catch{} },800);
+    }catch(e){ console.error("[ytj] play error", e); ui.notifications?.error("YouTube: failed to start playback (see console)."); }
+  },
+  async pauseAt(t){ await this.ensure(); try{ this._player.pauseVideo(); if(typeof t==="number") this._player.seekTo(t,true);}catch{} },
+  async hardStop(){ await this.ensure(); try{ this._player.pauseVideo(); this._player.seekTo(0,true);}catch{} },
+  async seek(t){ await this.ensure(); try{ this._player.seekTo(t,true);}catch{} },
+  get time(){ try{ return this._player.getCurrentTime()||0; }catch{ return 0; } },
+  setVolume(v){ try{ this._player?.setVolume?.(clamp0to100(Number(v)||0)); }catch{} },
+
+  /* ---------- overlay ---------- */
+  async mountOnceBg(){ if(this._mountedBg) return; this._mountedBg=true; this._ensureHostBg(); await this._loadAPI(); this._createBg(); await this.readyBg(); },
+  _ensureHostBg(){
+    let host=document.getElementById("ytj-player-ol");
+    if(!host){ host=document.createElement("div"); host.id="ytj-player-ol"; host.setAttribute("aria-label","YouTube overlay player");
+      Object.assign(host.style,{ position:"fixed", right:"12px", bottom:"12px", width:"1px", height:"1px", border:"0", background:"#000", borderRadius:"2px", zIndex:"4000" });
+      document.body.appendChild(host);
+    }
+  },
+  _createBg(){
+    const playerVars={ playsinline:1 }; if (location.protocol==="https:") playerVars.origin = location.origin;
+    this._readyPromiseBg = new Promise(r=>this._readyResolveBg=r);
+    this._playerBg = new YT.Player("ytj-player-ol", {
+      height:"1", width:"1", playerVars,
+      events:{
+        onReady:()=>{ try{ this._playerBg.setVolume(clamp0to100(Number(game.settings.get(YTJ_ID,"clientVolOverlay"))||40)); }catch{} this._readyResolveBg?.(true); },
+        onError:(e)=>{ const c=Number(e?.data); const msg=(c===2)?"Invalid parameter." : (c===5)?"Playback error in browser." : (c===100)?"Video not found." : (c===101||c===150)?"Embedding disabled by owner." : "YouTube player failure."; ui.notifications?.error(`Overlay: ${msg}`); console.error("[ytj] YT overlay onError", e?.data); },
+        onStateChange:(ev)=>{ try{ if(ev?.data===YT.PlayerState.ENDED){ YTJ_State.bgActive=false; YTJ_UI.refresh(); } }catch{} }
+      }
+    });
+  },
+  async readyBg(){ if(!this._readyPromiseBg) return true; try{ await this._readyPromiseBg; }catch{} return true; },
+  async ensureBg(){ const host=document.getElementById("ytj-player-ol"); if(!host){ this._mountedBg=false; this._playerBg=null; this._readyPromiseBg=null; this._readyResolveBg=null; } await this.mountOnceBg(); await this.readyBg(); },
+
+  async playBg(videoId, startedAt){
+    await this.ensureBg();
+    const start = startedAt ? Math.max(0,(Date.now()-startedAt)/1000) : 0;
+    try{
+      this._playerBg.loadVideoById(videoId, start);
+      setTimeout(()=>{ try{ this._playerBg.playVideo(); }catch{} },50);
+      setTimeout(()=>{ try{
+        const vd=this._playerBg.getVideoData?.()||{};
+        if(vd.title){ const pos = YTJ_Library.findVideo(videoId); if(pos){ const item = YTJ_Library.getItem(pos.g,pos.i); if(item && (!item.title || item.title===item.id)){ item.title = vd.title; if(YTJ_State.canEditLibrary()) YTJ_Library.save(true); YTJ_UI.refresh(); } } }
+      }catch{} },800);
+    }catch(e){ console.error("[ytj] playBg error", e); ui.notifications?.error("Overlay: failed to start playback (see console)."); }
+  },
+  async pauseBgAt(t){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); if(typeof t==="number") this._playerBg.seekTo(t,true);}catch{} },
+  async hardStopBg(){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); this._playerBg.seekTo(0,true);}catch{} },
+  async seekBg(t){ await this.ensureBg(); try{ this._playerBg.seekTo(t,true);}catch{} },
+  get timeBg(){ try{ return this._playerBg.getCurrentTime()||0; }catch{ return 0; } },
+  setVolumeBg(v){ try{ this._playerBg?.setVolume?.(clamp0to100(Number(v)||0)); }catch{} }
+};
+
+/* ------------------------------- Control ------------------------------- */
+const YTJ_Control = {
+  _assertCtrl(){ if(!YTJ_State.controller()){ ui.notifications?.warn("You don't have permission to control the jukebox (check module settings)."); return false; } return true; },
+
+  async loadUrl(url){
+    const parsed = YTJ_Util.parse(url);
+    if(!parsed){ ui.notifications?.error("Invalid YouTube link."); return; }
+    if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only the GM can modify the saved library.");
+
+    if(parsed.playlist){
+      const plName = (await YTJ_Data.fetchPlaylistTitle(parsed.playlist)) || `Playlist ${parsed.playlist.slice(0,6)}`;
+      const items = await YTJ_Data.loadPlaylist(parsed.playlist);
+      const gi = YTJ_Library.createGroup(plName, items);
+      await YTJ_Library.save(true);
+      if (items.some(it=>it.title===it.id)) YTJ_Data.fillTitlesNoApi(YTJ_Library.data.groups[gi].items).catch(()=>{});
+      ui.notifications?.info(`Playlist loaded: ${items.length} items.`);
+      YTJ_UI.refresh(); if (YTJ_State.selG<0){ YTJ_State.selG=gi; YTJ_State.selI=0; }
+    } else if(parsed.video){
+      const title = await YTJ_Data.fetchTitleForVideo(parsed.video);
+      const gi = YTJ_Library.groupIndexById("unsorted")>=0 ? YTJ_Library.groupIndexById("unsorted") : YTJ_Library.createGroup("Unsorted",[]);
+      YTJ_Library.addItemTo(gi, { id:parsed.video, title:title||parsed.video });
+      await YTJ_Library.save(true);
+      YTJ_UI.refresh(); if (YTJ_State.selG<0){ YTJ_State.selG=gi; YTJ_State.selI=0; }
+    }
+  },
+
+  createGroupPrompt(usePrompt=false){
+    if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can create groups.");
+    if (usePrompt) {
+      const nm = prompt("New group name:", "New Playlist");
+      if(nm && nm.trim()){
+        const gi = YTJ_Library.createGroup(nm.trim(), []);
+        YTJ_Library.save(true).then(()=>{ YTJ_State.renamePendingGroupId = YTJ_Library.data.groups[gi].id; YTJ_UI.refresh(); });
+      }
+    } else {
+      const gi = YTJ_Library.createGroup("New Playlist", []);
+      YTJ_Library.save(true).then(()=>{ YTJ_State.renamePendingGroupId = YTJ_Library.data.groups[gi].id; YTJ_UI.refresh(); });
+    }
+  },
+
+  select(g,i){ YTJ_State.selG=g; YTJ_State.selI=i; YTJ_UI.refresh(); },
+
+  /* ----- MAIN ----- */
+  playSelected(){
+    if(!this._assertCtrl()) return;
+    let { selG:g, selI:i } = YTJ_State; if(g<0||i<0) ({g,i}=YTJ_Library.firstPos()); if(g<0) return;
+
+    if(YTJ_State.paused && g===YTJ_State.g && i===YTJ_State.i){
+      const it = YTJ_Library.getItem(g,i); if(!it) return;
+      const t0=Math.max(0, YTJ_State.pausedTime||0); const startedAt = Date.now()-Math.floor(t0*1000);
+      const payload={cmd:"play", id:it.id, g, i, t:startedAt}; YTJ_State.paused=false; YTJ_State.stopped=false;
+      YTJ_Socket.emit(payload); YTJ_Player.play(it.id, startedAt); YTJ_UI.refresh(); return;
+    }
+
+    if(YTJ_State.stopped && g===YTJ_State.g && i===YTJ_State.i){
+      const it = YTJ_Library.getItem(g,i); if(!it) return;
+      const payload={cmd:"play", id:it.id, g, i, t:Date.now()}; YTJ_State.stopped=false; YTJ_State.paused=false; YTJ_State.pausedTime=0;
+      YTJ_Socket.emit(payload); YTJ_Player.play(it.id, payload.t); YTJ_UI.refresh(); return;
+    }
+
+    this.playAt(g,i);
+  },
+
+  playAt(g,i){
+    if(!this._assertCtrl()) return;
+    const it = YTJ_Library.getItem(g,i); if(!it) return;
+    YTJ_State.g=g; YTJ_State.i=i; YTJ_State.selG=g; YTJ_State.selI=i; YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=false;
+    const payload={cmd:"play", id:it.id, g, i, t:Date.now()}; YTJ_Socket.emit(payload); YTJ_Player.play(it.id, payload.t); YTJ_UI.refresh();
+  },
+
+  pause(){ if(!this._assertCtrl()) return; const t=YTJ_Player.time; YTJ_State.paused=true; YTJ_State.pausedTime=t; YTJ_State.stopped=false; YTJ_Socket.emit({cmd:"pause", t}); YTJ_Player.pauseAt(t); },
+  stop(){ if(!this._assertCtrl()) return; YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true; YTJ_Socket.emit({cmd:"stop"}); YTJ_Player.hardStop(); },
+  seek(t){ if(!this._assertCtrl()) return; YTJ_Socket.emit({cmd:"seek", t}); YTJ_Player.seek(t); },
+  next(){ if(!this._assertCtrl()) return; const pos=(YTJ_State.g>=0&&YTJ_State.i>=0)?{g:YTJ_State.g,i:YTJ_State.i}:YTJ_Library.firstPos(); if(pos.g<0) return; const n=YTJ_Library.nextPos(pos.g,pos.i); if(n) this.playAt(n.g,n.i); },
+  prev(){ if(!this._assertCtrl()) return; const pos=(YTJ_State.g>=0&&YTJ_State.i>=0)?{g:YTJ_State.g,i:YTJ_State.i}:YTJ_Library.firstPos(); if(pos.g<0) return; const p=YTJ_Library.prevPos(pos.g,pos.i); if(p) this.playAt(p.g,p.i); },
+  _onEnded(){ const n=YTJ_Library.nextPos(YTJ_State.g,YTJ_State.i); if(n) this.playAt(n.g,n.i); },
+
+  /* ----- OVERLAY ----- */
+  playOverlaySelected(){
+    if(!this._assertCtrl()) return;
+    let { selG:g, selI:i } = YTJ_State; if(g<0||i<0) ({g,i}=YTJ_Library.firstPos()); if(g<0) return;
+    const it = YTJ_Library.getItem(g,i); if(!it) return;
+    YTJ_State.bgG = g; YTJ_State.bgI = i; YTJ_State.bgPaused=false; YTJ_State.bgActive=true;
+    const payload={cmd:"playBg", id:it.id, g, i, t:Date.now()}; YTJ_Socket.emit(payload); YTJ_Player.playBg(it.id, payload.t);
+    const v = clamp0to100(Number(game.settings.get(YTJ_ID,"clientVolOverlay"))||40);
+    YTJ_Player.setVolumeBg(v);
+    YTJ_UI.refresh();
+  },
+
+  pauseOverlay(){
+    if(!this._assertCtrl()) return;
+    const t = YTJ_Player.timeBg;
+    YTJ_State.bgPaused=true; YTJ_State.bgPausedTime=t;
+    YTJ_Socket.emit({cmd:"pauseBg", t}); YTJ_Player.pauseBgAt(t); YTJ_UI.refresh();
+  },
+
+  stopOverlay(){
+    if(!this._assertCtrl()) return;
+    YTJ_State.bgPaused=false; YTJ_State.bgPausedTime=0; YTJ_State.bgActive=false;
+    YTJ_Socket.emit({cmd:"stopBg"}); YTJ_Player.hardStopBg(); YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_UI.refresh();
+  },
+
+  moveItem(fromG, fromI, toG){
+    if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can modify the library.");
+    YTJ_Library.moveItem(fromG, fromI, toG);
+    YTJ_Library.save(true).then(()=>YTJ_UI.refresh());
+  }
+};
+
+/* ------------------------------- Data ------------------------------- */
+const YTJ_Data = {
+  async loadPlaylist(plId){
+    const key=String(game.settings.get(YTJ_ID,"apiKey")||"").trim();
+    if(!key){ const ids=await this._idsFromIframe(plId); return ids.map(id=>({id,title:id})); }
+
+    const items=[]; let pageToken="";
+    while(true){
+      const url=new URL("https://www.googleapis.com/youtube/v3/playlistItems");
+      url.searchParams.set("part","snippet,contentDetails"); url.searchParams.set("maxResults","50");
+      url.searchParams.set("playlistId",plId); url.searchParams.set("key",key);
+      if(pageToken) url.searchParams.set("pageToken", pageToken);
+      const r=await fetch(url.toString()); if(!r.ok) throw new Error("YouTube API error");
+      const j=await r.json();
+      for(const it of (j.items||[])){ const id=it.contentDetails?.videoId; const title=it.snippet?.title||id; if(id) items.push({id,title}); }
+      pageToken=j.nextPageToken||""; if(!pageToken) break;
+    }
+    return items;
+  },
+
+  async fetchPlaylistTitle(plId){
+    const key=String(game.settings.get(YTJ_ID,"apiKey")||"").trim(); if(!key) return null;
+    const url=new URL("https://www.googleapis.com/youtube/v3/playlists"); url.searchParams.set("part","snippet"); url.searchParams.set("id",plId); url.searchParams.set("key",key);
+    const r=await fetch(url.toString()); if(!r.ok) return null; const j=await r.json(); const it=(j.items||[])[0]; return it?.snippet?.title || null;
+  },
+
+  async fillTitlesNoApi(list){
+    const missing=list.filter(x=>x&&(x.title===x.id||!x.title)); const limit=5; let i=0;
+    async function worker(){ while(i<missing.length){ const item=missing[i++]; if(!item) continue; try{ const title=await YTJ_Data.fetchTitleForVideo(item.id); if(title){ item.title=title; if(YTJ_State.canEditLibrary()) await YTJ_Library.save(true); YTJ_UI.refresh(); } }catch{} } }
+    await Promise.all(Array.from({length:Math.min(limit,missing.length)}, worker));
+  },
+
+  async fetchTitleForVideo(videoId){
+    try{ const u=`https://noembed.com/embed?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`; const r=await fetch(u,{mode:"cors"}); if(!r.ok) return null; const j=await r.json(); return j?.title||null; }
+    catch{ return null; }
+  },
+
+  _idsFromIframe(plId){
+    return new Promise((resolve)=>{
+      const div=document.createElement("div"); div.id="ytj-temp-pl"; div.style.position="fixed"; div.style.left="-9999px"; div.style.top="-9999px"; document.body.appendChild(div);
+      const finish=(ids)=>{ try{div.remove();}catch{} resolve(ids||[]); };
+      const create=()=>{ const p=new YT.Player("ytj-temp-pl",{ playerVars:{listType:"playlist", list:plId}, events:{ onReady:()=>{ setTimeout(()=>{ try{ const ids=p.getPlaylist?.()||[]; finish(ids); setTimeout(()=>{ try{p.destroy?.();}catch{} },0); }catch(e){ console.warn(e); finish([]);} },120); } } }); };
+      if(window.YT?.Player) create(); else { const s=document.createElement("script"); s.src="https://www.youtube.com/iframe_api"; window.onYouTubeIframeAPIReady=()=>create(); document.head.appendChild(s); }
+    });
+  }
+};
+
+/* ------------------------------- UI ------------------------------- */
+const YTJ_UI = {
+  app:null,
+  ensureApp(){ if(!this.app) this.app=new YTJ_AppClass(); return this.app; },
+  open(){ this.ensureApp().render(true); },
+  toggle(){ const a=this.ensureApp(); a.rendered? a.close(): a.render(true); },
+  refresh(){ try{ this.app?.render(false); }catch{} },
+
+  createFabWithVolume(){
+    // Read saved position
+    const pos = game.settings.get(YTJ_ID, "fabPos") || { top:10, left:56 };
+
+    // FAB
+    const fab=document.createElement("button");
+    fab.className="ytj-fab"; fab.title="YouTube Jukebox"; fab.innerHTML='<i class="fas fa-music"></i>';
+    Object.assign(fab.style,{
+      position:"fixed", top:(pos.top||10)+"px", left:(pos.left||56)+"px",
+      zIndex:"5000", cursor:"grab"
+    });
+    fab.addEventListener("click",(e)=>{ e.preventDefault(); e.stopPropagation(); YTJ_App.toggle(); });
+    document.body.appendChild(fab);
+
+    // Volume popover (Main + Overlay) — follows FAB
+    const pop=document.createElement("div");
+    pop.id="ytj-vol-pop";
+    Object.assign(pop.style,{ position:"fixed",
+      top: (pos.top+38)+"px", left: (pos.left)+"px",
+      padding:"8px 10px", background:"var(--color-bg,#1e1e1e)",
+      border:"1px solid var(--color-border-light-tertiary,#555)", borderRadius:"8px",
+      boxShadow:"0 6px 18px rgba(0,0,0,.35)", zIndex:"5001", display:"none", color:"var(--color-text,#fff)" });
+
+    const vMain=clamp0to100(Number(game.settings.get(YTJ_ID,"clientVol"))||40);
+    const vOL=clamp0to100(Number(game.settings.get(YTJ_ID,"clientVolOverlay"))||40);
+
+    pop.innerHTML=`<div style="display:flex;flex-direction:column;gap:8px;min-width:240px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <i class="fas fa-volume-off" style="opacity:.8"></i>
+        <input id="ytj-vol-range" type="range" min="0" max="100" value="${vMain}" style="flex:1"/>
+        <span id="ytj-vol-val" style="width:2.6em;text-align:right;opacity:.8">${vMain}</span>
+        <span style="opacity:.8">Main</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <i class="fas fa-volume-off" style="opacity:.8"></i>
+        <input id="ytj-vol-range-ol" type="range" min="0" max="100" value="${vOL}" style="flex:1"/>
+        <span id="ytj-vol-val-ol" style="width:2.6em;text-align:right;opacity:.8">${vOL}</span>
+        <span style="opacity:.8">OL</span>
+      </div>
+      <div style="font-size:11px;opacity:.7">Tip: Right-click the music icon to toggle this panel.</div>
+    </div>`;
+    document.body.appendChild(pop);
+
+    let t=null; const show=()=>{ clearTimeout(t); pop.style.display="block"; }; const hide=()=>{ t=setTimeout(()=>pop.style.display="none",220); };
+    fab.addEventListener("mouseenter",show); fab.addEventListener("mouseleave",hide); pop.addEventListener("mouseenter",show); pop.addEventListener("mouseleave",hide);
+    fab.addEventListener("contextmenu",(e)=>{ e.preventDefault(); e.stopPropagation(); pop.style.display=(pop.style.display==="none")?"block":"none"; });
+
+    const range=pop.querySelector("#ytj-vol-range"); const val=pop.querySelector("#ytj-vol-val");
+    range.addEventListener("input",(ev)=>{ const v=clamp0to100(Number(ev.currentTarget.value||0)); val.textContent=String(v); game.settings.set(YTJ_ID,"clientVol",v); YTJ_Player.setVolume(v); });
+
+    const rangeOL=pop.querySelector("#ytj-vol-range-ol"); const valOL=pop.querySelector("#ytj-vol-val-ol");
+    rangeOL.addEventListener("input",(ev)=>{ const v=clamp0to100(Number(ev.currentTarget.value||0)); valOL.textContent=String(v); game.settings.set(YTJ_ID,"clientVolOverlay",v); YTJ_Player.setVolumeBg(v); });
+
+    let dragging = false, offX=0, offY=0;
+
+    const onDown = (e)=>{
+      if (e.button !== 0) return; // only left
+      dragging = true;
+      fab.style.cursor = "grabbing";
+      const rect = fab.getBoundingClientRect();
+      offX = e.clientX - rect.left;
+      offY = e.clientY - rect.top;
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp, { once:true });
+    };
+
+    const onMove = (e)=>{
+      if (!dragging) return;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      // size of button (approx)
+      const bw = fab.offsetWidth || 36, bh = fab.offsetHeight || 36;
+      let left = e.clientX - offX;
+      let top  = e.clientY - offY;
+      // clamp inside viewport
+      left = Math.max(4, Math.min(vw - bw - 4, left));
+      top  = Math.max(4, Math.min(vh - bh - 4, top));
+      fab.style.left = left + "px";
+      fab.style.top  = top  + "px";
+      // follow popover
+      pop.style.left = left + "px";
+      pop.style.top  = (top + 38) + "px";
+    };
+
+    const onUp = ()=>{
+      dragging = false;
+      fab.style.cursor = "grab";
+      window.removeEventListener("pointermove", onMove);
+      // persist new position
+      const top = parseInt(fab.style.top,10) || 10;
+      const left = parseInt(fab.style.left,10) || 56;
+      game.settings.set(YTJ_ID, "fabPos", { top, left });
+    };
+
+    fab.addEventListener("pointerdown", onDown);
+
+    // Also update popover position when window resizes (keep relative coords)
+    window.addEventListener("resize", ()=>{
+      const top = parseInt(fab.style.top,10) || 10;
+      const left = parseInt(fab.style.left,10) || 56;
+      pop.style.left = left + "px";
+      pop.style.top  = (top + 38) + "px";
+    });
+  }
+};
+
+class YTJ_AppClass extends Application {
+  static get defaultOptions(){
+    return foundry.utils.mergeObject(super.defaultOptions,{
+      id:"ytj-app", title:"YouTube Jukebox", popOut:true, width:720, height:560, resizable:true, classes:["ytj-app"], template:""
+    });
+  }
+
+  async _renderInner(){
+    const root=document.createElement("div");
+    const style = `
+      <style>
+        #ytj-app .window-content{ padding:0 !important; }
+        .ytj-root{ min-height:100%; display:flex; flex-direction:column; }
+        .ytj-top{ position:sticky; top:0; z-index:3; background:var(--color-bg,#f0f0f0);
+                  border-bottom:1px solid var(--color-border-light-tertiary); box-shadow:0 2px 6px rgba(0,0,0,.12); }
+        .ytj-header{ display:flex; gap:8px; align-items:center; padding:10px 10px 6px; }
+        .ytj-input{ flex:1; height:34px; padding:0 10px; font-size:13px; }
+
+        .ytj-ctrls{ display:flex; gap:6px; align-items:center; padding:6px 10px 10px;
+                    flex-wrap:nowrap; overflow-x:auto; white-space:nowrap; }
+        .ytj-ctrls button{ margin-right:6px; }
+
+        .ytj-content{ padding:10px; display:flex; flex-direction:column; gap:10px; }
+
+        .ytj-group{ border:1px solid var(--color-border-light-tertiary); border-radius:10px; overflow:hidden; background:rgba(0,0,0,0.03); }
+        .ytj-group-header{ display:flex; align-items:center; gap:6px; padding:6px 8px; background:rgba(0,0,0,0.04); }
+        .ytj-group-header .icon{ width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center;
+                                  border:1px solid var(--color-border-light-tertiary); border-radius:6px; background:var(--color-bg,#f0f0f0);
+                                  cursor:pointer; padding:0; }
+        .ytj-group-header .icon i{ font-size:11px; line-height:1; }
+        .ytj-group-header .name{ font-weight:600; flex:1; cursor:text; padding:2px 6px; }
+        .ytj-group-header .name[contenteditable="true"]{ outline:2px solid rgba(100,180,255,.65); border-radius:6px; background:var(--color-bg,#fff); }
+        .ytj-group-header .count{ opacity:.7; font-size:12px; width:2.5em; text-align:right; }
+        .ytj-group-items{ padding:8px; display:grid; gap:6px; grid-auto-rows:min-content; }
+
+        .ytj-item{ min-height:28px; display:flex; gap:8px; align-items:center; padding:6px 8px;
+                   border:1px solid var(--color-border-light-tertiary); border-radius:8px; cursor:pointer; background:var(--ytj-bg,transparent); }
+        .ytj-item .idx{ width:2.2em; text-align:right; opacity:.7; }
+        .ytj-item .t{ flex:1; }
+        .ytj-item .m{ opacity:.55; font-size:11px; }
+        .ytj-item .mini{ width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center;
+                         border:1px solid var(--color-border-light-tertiary); border-radius:6px; background:var(--color-bg,#f0f0f0);
+                         cursor:pointer; padding:0; }
+        .ytj-item .mini i{ font-size:11px; line-height:1; }
+        .ytj-item.selected{ --ytj-bg:rgba(100,180,255,.12); outline:2px solid rgba(100,180,255,.65); }
+        .ytj-item.playing{ background:var(--color-bg-option); }
+        .ytj-item.overlaying{ outline:2px solid rgba(255,210,50,.85); box-shadow:0 0 0 3px rgba(255,210,50,.25) inset; }
+
+        /* Move modal */
+        .ytj-modal-back{ position:fixed; inset:0; background:rgba(0,0,0,.4); z-index:9998; }
+        .ytj-modal{ position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:9999; }
+        .ytj-modal .card{ background:var(--color-bg,#1e1e1e); border:1px solid var(--color-border-light-tertiary);
+                           border-radius:10px; padding:12px; min-width:300px; box-shadow:0 10px 28px rgba(0,0,0,.45);
+                           color:var(--color-text,#fff); }
+        .ytj-modal .row{ display:flex; gap:8px; align-items:center; margin-top:10px; justify-content:flex-end; }
+        .ytj-modal select{ width:100%; }
+      </style>
+    `;
+    root.innerHTML = `
+      ${style}
+      <div class="ytj-root">
+        <div class="ytj-top">
+          <div class="ytj-header">
+            <input id="ytj-url" class="ytj-input" placeholder="Paste a YouTube video or playlist URL…" />
+            <button id="ytj-join">Enable Audio</button>
+            <button id="ytj-load">Add</button>
+            <button id="ytj-newgrp" title="Create empty group">New Group</button>
+          </div>
+          <div class="ytj-ctrls">
+            <button id="ytj-prev">Previous</button>
+            <button id="ytj-play">Play</button>
+            <button id="ytj-pause">Pause</button>
+            <button id="ytj-stop">Stop</button>
+            <button id="ytj-next">Next</button>
+            <button id="ytj-sync">Sync</button>
+            <span style="width:1px;height:18px;background:var(--color-border-light-tertiary);display:inline-block;margin:0 8px;"></span>
+            <button id="ytj-play-ol" title="Play selected as overlay (simultaneous)">Overlay</button>
+            <button id="ytj-pause-ol" title="Pause overlay only">Pause OL</button>
+            <button id="ytj-stop-ol" title="Stop overlay only">Stop OL</button>
+          </div>
+        </div>
+
+        <div id="ytj-content" class="ytj-content"></div>
+        <div style="padding:8px 10px;font-size:11px;opacity:.75">
+          Tip: select a track and use <b>Overlay</b> to play it simultaneously with the main track. Overlay won't auto-advance.
+        </div>
+      </div>
+    `;
+    return $(root);
+  }
+
+activateListeners(html){
+  super.activateListeners(html);
+
+  html.find("#ytj-load").on("click", async ()=>{
+    const v = String(html.find("#ytj-url").val()||"").trim(); if(!v) return;
+    await YTJ_Control.loadUrl(v);
+    html.find("#ytj-url").val("");
+  });
+
+  html.find("#ytj-join").on("click", ()=>Promise.all([YTJ_Player.ensure(), YTJ_Player.ensureBg()]).then(()=>ui.notifications?.info("Audio enabled on this client.")));
+  html.find("#ytj-play").on("click", ()=>YTJ_Control.playSelected());
+  html.find("#ytj-pause").on("click", ()=>YTJ_Control.pause());
+  html.find("#ytj-stop").on("click", ()=>YTJ_Control.stop());
+  html.find("#ytj-next").on("click", ()=>YTJ_Control.next());
+  html.find("#ytj-prev").on("click", ()=>YTJ_Control.prev());
+  html.find("#ytj-sync").on("click", ()=>YTJ_Control.seek(YTJ_Player.time));
+  html.find("#ytj-newgrp").on("click", ()=> YTJ_Control.createGroupPrompt(false));
+
+  // Overlay
+  html.find("#ytj-play-ol").on("click", ()=>YTJ_Control.playOverlaySelected());
+  html.find("#ytj-pause-ol").on("click", ()=>YTJ_Control.pauseOverlay());
+  html.find("#ytj-stop-ol").on("click", ()=>YTJ_Control.stopOverlay());
+
+    // render library/groups/items
+    const host=this.element.find("#ytj-content")[0];
+    host.innerHTML="";
+
+    const G = YTJ_Library.data.groups;
+    for (let gi=0; gi<G.length; gi++){
+      const grp=G[gi];
+      const wrapG=document.createElement("div"); wrapG.className="ytj-group";
+
+      const hdr=document.createElement("div"); hdr.className="ytj-group-header";
+      hdr.innerHTML = `
+        <button class="icon toggle" title="${grp.collapsed?"Expand":"Collapse"}"><i class="fas ${grp.collapsed?"fa-chevron-right":"fa-chevron-down"}"></i></button>
+        <div class="name" title="Double-click to rename" contenteditable="false">${escapeHTML(grp.name)}</div>
+        <div class="count" title="Items in group">${grp.items.length}</div>
+        <button class="icon delgrp" title="Delete group"><i class="fas fa-trash"></i></button>
+      `;
+      wrapG.appendChild(hdr);
+
+      const body=document.createElement("div"); body.className="ytj-group-items"; body.style.display=grp.collapsed?"none":"grid";
+
+      grp.items.forEach((it, ii)=>{
+        const el=document.createElement("div"); el.className="ytj-item";
+        if(gi===YTJ_State.selG && ii===YTJ_State.selI) el.classList.add("selected");
+        if(gi===YTJ_State.g && ii===YTJ_State.i) el.classList.add("playing");
+        if(gi===YTJ_State.bgG && ii===YTJ_State.bgI && YTJ_State.bgActive) el.classList.add("overlaying");
+        const t = it.title || it.id;
+        el.innerHTML = `
+          <span class="idx">${ii+1}.</span>
+          <span class="t">${escapeHTML(t)}</span>
+          <span class="m">${escapeHTML(it.id)}</span>
+          <button class="mini move" title="Move to..."><i class="fas fa-arrow-right"></i></button>
+          <button class="mini trash" title="Remove"><i class="fas fa-times"></i></button>
+        `;
+        el.addEventListener("click",(ev)=>{ if (ev.target.closest(".mini")) return; YTJ_Control.select(gi,ii); });
+
+        // remover
+        el.querySelector(".trash").addEventListener("click", async (ev)=>{
+          ev.stopPropagation();
+          if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can edit the library.");
+          if (confirm("Remove this track from the group?")){
+            YTJ_Library.deleteItem(gi,ii);
+            await YTJ_Library.save(true);
+            if (gi===YTJ_State.g && ii===YTJ_State.i){ YTJ_Control.stop(); YTJ_State.g=-1; YTJ_State.i=-1; }
+            if (gi===YTJ_State.bgG && ii===YTJ_State.bgI){ YTJ_Control.stopOverlay(); }
+            YTJ_UI.refresh();
+          }
+        });
+
+        // mover (modal)
+        el.querySelector(".move").addEventListener("click",(ev)=>{
+          ev.stopPropagation();
+          if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can edit the library.");
+
+          const back = document.createElement("div"); back.className="ytj-modal-back";
+          const modal = document.createElement("div"); modal.className="ytj-modal";
+          const card = document.createElement("div"); card.className="card";
+          card.innerHTML = `
+            <div><b>Move track</b></div>
+            <div style="margin-top:8px">Destination group:</div>
+            <select id="ytj-move-sel" style="margin-top:4px"></select>
+            <div class="row">
+              <button id="ytj-move-cancel">Cancel</button>
+              <button id="ytj-move-ok">Move</button>
+            </div>`;
+          modal.appendChild(card);
+          document.body.appendChild(back);
+          document.body.appendChild(modal);
+
+          const sel = card.querySelector("#ytj-move-sel");
+          YTJ_Library.data.groups.forEach((g, idx)=>{ const o=document.createElement("option"); o.value=String(idx); o.textContent=g.name; if(idx===gi) o.selected=true; sel.appendChild(o); });
+
+          const cleanup = ()=>{ try{ modal.remove(); }catch{} try{ back.remove(); }catch{} };
+          card.querySelector("#ytj-move-cancel").addEventListener("click",(e)=>{ e.stopPropagation(); cleanup(); });
+          card.querySelector("#ytj-move-ok").addEventListener("click",(e)=>{ e.stopPropagation(); const toG = Number(sel.value); cleanup(); if(toG===gi) return; YTJ_Control.moveItem(gi,ii,toG); });
+        });
+
+        body.appendChild(el);
+      });
+
+      wrapG.appendChild(body);
+      host.appendChild(wrapG);
+
+      // toggle collapse
+      hdr.querySelector(".toggle").addEventListener("click", async ()=>{
+        YTJ_Library.toggleCollapsed(gi); await YTJ_Library.save(true); YTJ_UI.refresh();
+      });
+
+      // delete group
+      hdr.querySelector(".delgrp").addEventListener("click", async ()=>{
+        if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can delete groups.");
+        if(!confirm(`Delete group "${grp.name}" and all its items?`)) return;
+        if (gi===YTJ_State.g){ YTJ_Control.stop(); YTJ_State.g=-1; YTJ_State.i=-1; }
+        if (gi===YTJ_State.bgG){ YTJ_Control.stopOverlay(); }
+        YTJ_Library.deleteGroup(gi); await YTJ_Library.save(true);
+        YTJ_UI.refresh();
+      });
+
+      // INLINE RENAME
+      const nameEl = hdr.querySelector(".name");
+      nameEl.addEventListener("dblclick", () => {
+        if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can rename groups.");
+        nameEl.setAttribute("contenteditable","true");
+        nameEl.focus();
+        document.execCommand("selectAll", false, null);
+      });
+      const finishRename = async () => {
+        const newName = nameEl.textContent.trim();
+        nameEl.setAttribute("contenteditable","false");
+        if (newName && newName !== grp.name){
+          YTJ_Library.renameGroup(gi, newName);
+          await YTJ_Library.save(true);
+          YTJ_UI.refresh();
+        } else {
+          nameEl.textContent = grp.name;
+        }
+      };
+      nameEl.addEventListener("blur", finishRename);
+      nameEl.addEventListener("keydown", (ev)=>{
+        if (ev.key === "Enter"){ ev.preventDefault(); nameEl.blur(); }
+        if (ev.key === "Escape"){ ev.preventDefault(); nameEl.textContent = grp.name; nameEl.blur(); }
+      });
+
+      // focus rename if newly created
+      if (YTJ_State.renamePendingGroupId && grp.id === YTJ_State.renamePendingGroupId) {
+        YTJ_State.renamePendingGroupId = null;
+        setTimeout(()=>{
+          nameEl.setAttribute("contenteditable","true");
+          nameEl.focus();
+          document.execCommand("selectAll", false, null);
+        }, 0);
+      }
+    }
+  }
+}
+
+/* ------------------------------- Utils ------------------------------- */
+const YTJ_Util = {
+  parse(u){ try{
+    const url=new URL(u);
+    if(!/youtube\.com|youtu\.be/.test(url.hostname)) return null;
+    const v=(url.searchParams.get("v")||"").trim();
+    const list=(url.searchParams.get("list")||"").trim();
+    if(url.hostname==="youtu.be"){ const seg=url.pathname.split("/").filter(Boolean); if(seg[0]) return {video:seg[0], playlist:list||null}; }
+    if(v||list) return { video:v||null, playlist:list||null };
+    if(url.pathname.includes("/playlist") && list) return { video:null, playlist:list };
+    return null;
+  }catch{ return null; } }
+};
+
+const YTJ_App = {
+  toggle(force){ const a=YTJ_UI.ensureApp(); const open = force ?? !a.rendered; if(open) a.render(true); else a.close(); },
+  close(){ YTJ_UI.app?.close(); }
+};
+
+/* ------------------------------- Helpers ------------------------------- */
+function clamp0to100(n){ n=Number(n)||0; if(n<0)return 0; if(n>100)return 100; return Math.round(n); }
+function randomId(len=8){ const c="abcdefghijklmnopqrstuvwxyz0123456789"; let s=""; for(let i=0;i<len;i++) s+=c[(Math.random()*c.length)|0]; return s; }
+function escapeHTML(s){ return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }

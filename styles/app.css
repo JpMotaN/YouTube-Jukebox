@@ -1,0 +1,25 @@
+.ytj-fab {
+position: fixed; top: 10px; left: 56px; z-index: 5000;
+width: 36px; height: 36px; border-radius: 999px;
+display: grid; place-items: center;
+border: 1px solid var(--color-border-light-tertiary);
+background: var(--color-border-light-highlight);
+box-shadow: 0 2px 6px rgba(0,0,0,.2);
+cursor: pointer;
+}
+.ytj-fab i { font-size: 14px; }
+
+
+.ytj-app { overflow: hidden; }
+.ytj-header { display:flex; gap:8px; padding:8px; }
+.ytj-input { flex:1; }
+.ytj-ctrls { display:flex; gap:6px; padding: 0 8px 8px; align-items:center; }
+.ytj-results { padding: 8px; overflow:auto; height: calc(100% - 160px); }
+.ytj-item { padding:6px 8px; border-bottom:1px solid var(--color-border-light-tertiary); cursor:pointer; }
+.ytj-item:hover { background: var(--color-bg-option); }
+.ytj-item .t { font-weight:600; display:block; }
+.ytj-item .m { font-size:11px; opacity:.7; }
+
+
+/* player visível para cumprir ToS: mantemos um iframe pequeno */
+.ytj-player { width: 320px; height: 180px; border:0; background:#000; }
