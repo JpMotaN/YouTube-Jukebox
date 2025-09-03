@@ -3,7 +3,12 @@ name: Publish to Foundry Package API
 on:
   release:
     types: [published]
-  workflow_dispatch: {}   # opcional: permite rodar manualmente
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag para publicar (ex.: v0.1.1). Se vazio, usa a última tag."
+        required: false
+        default: ""
 
 jobs:
   publish:
@@ -14,31 +19,49 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract version from tag
-        id: ver
+      - name: Resolve TAG and VERSION
+        id: meta
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"             # ex.: v0.1.1
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "version=${TAG#v}" >> $GITHUB_OUTPUT  # -> 0.1.1
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            TAG="${GITHUB_REF_NAME}"                      # ex.: v0.1.1
+          else
+            # Se o usuário forneceu input.tag no disparo manual, usa; senão pega a última tag do repo
+            if [ -n "${{ github.event.inputs.tag }}" ]; then
+              TAG="${{ github.event.inputs.tag }}"
+            else
+              TAG="$(git describe --tags --abbrev=0)"
+            fi
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERRO: TAG inválida: '$TAG'. Use formato vX.Y.Z (ex.: v0.1.1)." >&2
+            exit 2
+          fi
+
+          VERSION="${TAG#v}"                               # tira o 'v' -> 0.1.1
+          echo "tag=$TAG"       >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Usando TAG=$TAG / VERSION=$VERSION"
 
       - name: Dry run (validate)
         id: dryrun
         shell: bash
         env:
           FOUNDRY_RELEASE_TOKEN: ${{ secrets.FOUNDRY_RELEASE_TOKEN }}
-          VERSION: ${{ steps.ver.outputs.version }}
-          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           payload='{"id":"yt-jukebox","dry-run":true,"release":{"version":"'"$VERSION"'","manifest":"https://raw.githubusercontent.com/JpMotaN/YouTube-Jukebox/'"$TAG"'/module.json","notes":"https://github.com/JpMotaN/YouTube-Jukebox/releases/tag/'"$TAG"'","compatibility":{"minimum":"12","verified":"13","maximum":""}}}'
           echo "$payload" > dryrun_body.json
 
+          echo "POST (dry-run) para Foundry..."
           curl -sS -X POST "https://foundryvtt.com/_api/packages/release_version/" \
             -H "Content-Type: application/json" \
             -H "Authorization: ${FOUNDRY_RELEASE_TOKEN}" \
             -d "$payload" | tee dryrun_response.json
 
-          # valida que o status retornado é success
+          # precisa do jq (já vem instalado nos runners)
           jq -e '.status == "success"' dryrun_response.json > /dev/null
 
       - name: Publish (no dry-run)
@@ -46,12 +69,13 @@ jobs:
         shell: bash
         env:
           FOUNDRY_RELEASE_TOKEN: ${{ secrets.FOUNDRY_RELEASE_TOKEN }}
-          VERSION: ${{ steps.ver.outputs.version }}
-          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          TAG: ${{ steps.meta.outputs.tag }}
         run: |
           payload='{"id":"yt-jukebox","release":{"version":"'"$VERSION"'","manifest":"https://raw.githubusercontent.com/JpMotaN/YouTube-Jukebox/'"$TAG"'/module.json","notes":"https://github.com/JpMotaN/YouTube-Jukebox/releases/tag/'"$TAG"'","compatibility":{"minimum":"12","verified":"13","maximum":""}}}'
           echo "$payload" > publish_body.json
 
+          echo "Publicando versão..."
           curl -sS -X POST "https://foundryvtt.com/_api/packages/release_version/" \
             -H "Content-Type: application/json" \
             -H "Authorization: ${FOUNDRY_RELEASE_TOKEN}" \
