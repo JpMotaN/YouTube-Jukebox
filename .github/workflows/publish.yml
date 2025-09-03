@@ -3,7 +3,7 @@ name: Publish to Foundry Package API
 on:
   release:
     types: [published]
-  workflow_dispatch: {}   # opcional: permite rodar manualmente pela aba Actions
+  workflow_dispatch: {}   # opcional: permite rodar manualmente
 
 jobs:
   publish:
@@ -18,51 +18,43 @@ jobs:
         id: ver
         shell: bash
         run: |
-          TAG="${GITHUB_REF_NAME}"             # ex.: v0.1.0
+          TAG="${GITHUB_REF_NAME}"             # ex.: v0.1.1
           echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "version=${TAG#v}" >> $GITHUB_OUTPUT  # -> 0.1.0
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT  # -> 0.1.1
 
       - name: Dry run (validate)
         id: dryrun
         shell: bash
         env:
           FOUNDRY_RELEASE_TOKEN: ${{ secrets.FOUNDRY_RELEASE_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
+          payload='{"id":"yt-jukebox","dry-run":true,"release":{"version":"'"$VERSION"'","manifest":"https://raw.githubusercontent.com/JpMotaN/YouTube-Jukebox/'"$TAG"'/module.json","notes":"https://github.com/JpMotaN/YouTube-Jukebox/releases/tag/'"$TAG"'","compatibility":{"minimum":"12","verified":"13","maximum":""}}}'
+          echo "$payload" > dryrun_body.json
+
           curl -sS -X POST "https://foundryvtt.com/_api/packages/release_version/" \
             -H "Content-Type: application/json" \
             -H "Authorization: ${FOUNDRY_RELEASE_TOKEN}" \
-            -d @- <<'JSON' | tee dryrun.json
-          {
-            "id": "yt-jukebox",
-            "dry-run": true,
-            "release": {
-              "version": "${{ steps.ver.outputs.version }}",
-              "manifest": "https://raw.githubusercontent.com/JpMotaN/YouTube-Jukebox/${{ steps.ver.outputs.tag }}/module.json",
-              "notes": "https://github.com/JpMotaN/YouTube-Jukebox/releases/tag/${{ steps.ver.outputs.tag }}",
-              "compatibility": { "minimum": "12", "verified": "13", "maximum": "" }
-            }
-          }
-JSON
-          # Valida que o status retornou success
-          jq -e '.status == "success"' dryrun.json > /dev/null
+            -d "$payload" | tee dryrun_response.json
+
+          # valida que o status retornado é success
+          jq -e '.status == "success"' dryrun_response.json > /dev/null
 
       - name: Publish (no dry-run)
         if: steps.dryrun.outcome == 'success'
         shell: bash
         env:
           FOUNDRY_RELEASE_TOKEN: ${{ secrets.FOUNDRY_RELEASE_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
+          payload='{"id":"yt-jukebox","release":{"version":"'"$VERSION"'","manifest":"https://raw.githubusercontent.com/JpMotaN/YouTube-Jukebox/'"$TAG"'/module.json","notes":"https://github.com/JpMotaN/YouTube-Jukebox/releases/tag/'"$TAG"'","compatibility":{"minimum":"12","verified":"13","maximum":""}}}'
+          echo "$payload" > publish_body.json
+
           curl -sS -X POST "https://foundryvtt.com/_api/packages/release_version/" \
             -H "Content-Type: application/json" \
             -H "Authorization: ${FOUNDRY_RELEASE_TOKEN}" \
-            -d @- <<'JSON'
-          {
-            "id": "yt-jukebox",
-            "release": {
-              "version": "${{ steps.ver.outputs.version }}",
-              "manifest": "https://raw.githubusercontent.com/JpMotaN/YouTube-Jukebox/${{ steps.ver.outputs.tag }}/module.json",
-              "notes": "https://github.com/JpMotaN/YouTube-Jukebox/releases/tag/${{ steps.ver.outputs.tag }}",
-              "compatibility": { "minimum": "12", "verified": "13", "maximum": "" }
-            }
-          }
-JSON
+            -d "$payload" | tee publish_response.json
+
+          jq -e '.status == "success"' publish_response.json > /dev/null
