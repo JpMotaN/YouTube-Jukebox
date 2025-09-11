@@ -1,5 +1,5 @@
 /**
- * YouTube Jukebox – main.js v0.1.3
+ * YouTube Jukebox – main.js v0.1.2
  * - Visible mini-player (200x200) while main track is playing/paused (YouTube compliance).
  * - Mini-player is draggable and remembers per-client position.
  * - Overlay improvements kept (Pause OL + per-client Overlay volume in FAB popover).
@@ -1039,3 +1039,4 @@ const YTJ_App = {
 function clamp0to100(n){ n=Number(n)||0; if(n<0)return 0; if(n>100)return 100; return Math.round(n); }
 function randomId(len=8){ const c="abcdefghijklmnopqrstuvwxyz0123456789"; let s=""; for(let i=0;i<len;i++) s+=c[(Math.random()*c.length)|0]; return s; }
 function escapeHTML(s){ return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
+
