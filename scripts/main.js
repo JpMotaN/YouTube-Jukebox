@@ -1,7 +1,7 @@
 /**
- * YouTube Jukebox – main.js v0.1.2
- * - Visible mini-player (200x200) while main track is playing/paused (YouTube compliance).
- * - Mini-player is draggable and remembers per-client position.
+ * YouTube Jukebox – main.js v0.1.3
+ * - Visible mini-player (200x200) for MAIN track (draggable, persistent).
+ * - NEW: Visible mini-player (200x200) for OVERLAY track (draggable, persistent).
  * - Overlay improvements kept (Pause OL + per-client Overlay volume in FAB popover).
  * - Draggable FAB (per-client position persists). Volume popover follows the FAB.
  * - Configurable keybinding (default Ctrl/Cmd + K) via Foundry's Keybindings UI.
@@ -46,10 +46,14 @@ Hooks.once("init", () => {
     scope: "client", config: false, type: Object, default: { top: 10, left: 56 }
   });
 
-  // Client-persistent Mini Player position
+  // Client-persistent Mini Player positions
   game.settings.register(YTJ_ID, "miniPos", {
-    name: "Mini Player Position",
+    name: "Mini Player Position (Main)",
     scope: "client", config: false, type: Object, default: { top: 120, left: 120 }
+  });
+  game.settings.register(YTJ_ID, "miniPosOverlay", {
+    name: "Mini Player Position (Overlay)",
+    scope: "client", config: false, type: Object, default: { top: 120, left: 350 }
   });
 
   // Keybinding (configurable in Foundry's Keybindings UI)
@@ -98,7 +102,7 @@ const YTJ_State = {
 /* ------------------------------- Mini Player (visible 200x200) ------------------------------- */
 const YTJ_Mini = {
   panel: null,
-  host: null,   // #ytj-player container (shared with YT API)
+  host: null,   // #ytj-player container (main)
   btnPlay: null,
   btnPause: null,
   isVisible: false,
@@ -184,10 +188,10 @@ const YTJ_Mini = {
     this.btnPause.addEventListener("click", ()=> YTJ_Control.pause());
 
     // Drag
-    this._setupDrag(hdr, el);
+    this._setupDrag(hdr, el, "miniPos");
   },
 
-  _setupDrag(handle, el){
+  _setupDrag(handle, el, settingKey){
     let dragging=false, pid=null, offX=0, offY=0;
     let tLeft=parseInt(el.style.left,10)||120, tTop=parseInt(el.style.top,10)||120;
     let raf=false;
@@ -208,7 +212,7 @@ const YTJ_Mini = {
       if(e.pointerId!==pid) return;
       dragging=false; pid=null; handle.style.cursor="grab";
       const top=tTop, left=tLeft;
-      game.settings.set(YTJ_ID,"miniPos",{top,left});
+      game.settings.set(YTJ_ID, settingKey, {top,left});
       window.removeEventListener("pointermove", onMove);
     };
     handle.addEventListener("pointerdown",(e)=>{
@@ -224,34 +228,155 @@ const YTJ_Mini = {
 
   attachHostToPanel(){
     this.ensure();
-    // ensure host (#ytj-player) stays inside mini body
     const body = this.panel?.children?.[1];
     if (body && this.host && this.host.parentElement !== body){
       try { body.appendChild(this.host); } catch {}
     }
   },
 
-  show(){
+  show(){ this.ensure(); this.attachHostToPanel(); if (!this.isVisible){ this.panel.style.display="block"; this.isVisible=true; } },
+  hide(){ if (this.panel){ this.panel.style.display="none"; this.isVisible=false; } },
+  setPaused(paused){ if (!this.panel) return; this.btnPlay.disabled=!paused; this.btnPause.disabled=paused; }
+};
+
+/* ------------------------------- Mini Player (OVERLAY, 200x200) ------------------------------- */
+const YTJ_MiniBg = {
+  panel: null,
+  host: null,   // #ytj-player-ol container (overlay)
+  btnPlay: null,
+  btnPause: null,
+  isVisible: false,
+
+  ensure(){
+    if (this.panel) return;
+
+    const pos = game.settings.get(YTJ_ID, "miniPosOverlay") || { top:120, left:350 };
+
+    // Panel
+    const el = document.createElement("div");
+    el.id = "ytj-mini-ol";
+    Object.assign(el.style, {
+      position: "fixed",
+      top: (pos.top||120) + "px",
+      left: (pos.left||350) + "px",
+      width: "220px",
+      minWidth: "220px",
+      background: "var(--color-bg, #1e1e1e)",
+      color: "var(--color-text, #fff)",
+      border: "1px solid var(--color-border-light-tertiary, #555)",
+      borderRadius: "10px",
+      boxShadow: "0 8px 24px rgba(0,0,0,.35)",
+      zIndex: "5002",
+      display: "none",
+      overflow: "hidden"
+    });
+
+    // Header (draggable)
+    const hdr = document.createElement("div");
+    Object.assign(hdr.style, {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: "8px",
+      padding: "6px 8px",
+      background: "rgba(255,255,255,.06)",
+      cursor: "grab",
+      userSelect: "none"
+    });
+    hdr.innerHTML = `<div style="font-weight:600">Overlay Player</div>
+      <div style="display:flex; gap:6px">
+        <button id="ytj-mini-ol-pause">Pause</button>
+        <button id="ytj-mini-ol-play">Play</button>
+      </div>`;
+    el.appendChild(hdr);
+
+    // Body (200x200)
+    const body = document.createElement("div");
+    Object.assign(body.style, {
+      width: "100%",
+      height: "200px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      background: "#000"
+    });
+
+    // Host for the YT iframe (#ytj-player-ol)
+    let host = document.getElementById("ytj-player-ol");
+    if (!host){
+      host = document.createElement("div");
+      host.id = "ytj-player-ol";
+    }
+    Object.assign(host.style, {
+      width: "200px",
+      height: "200px",
+      border: "0"
+    });
+    body.appendChild(host);
+    el.appendChild(body);
+
+    document.body.appendChild(el);
+
+    // Refs
+    this.panel = el;
+    this.host  = host;
+    this.btnPlay  = el.querySelector("#ytj-mini-ol-play");
+    this.btnPause = el.querySelector("#ytj-mini-ol-pause");
+
+    // Buttons (overlay actions)
+    this.btnPlay.addEventListener("click", ()=> YTJ_Control.playOverlaySelected());
+    this.btnPause.addEventListener("click", ()=> YTJ_Control.pauseOverlay());
+
+    // Drag
+    this._setupDrag(hdr, el, "miniPosOverlay");
+  },
+
+  _setupDrag(handle, el, settingKey){
+    let dragging=false, pid=null, offX=0, offY=0;
+    let tLeft=parseInt(el.style.left,10)||350, tTop=parseInt(el.style.top,10)||120;
+    let raf=false;
+
+    const apply=()=>{ raf=false; el.style.left=tLeft+"px"; el.style.top=tTop+"px"; };
+
+    const onMove=(e)=>{
+      if(!dragging || e.pointerId!==pid) return;
+      const rect=el.getBoundingClientRect();
+      const vw=window.innerWidth, vh=window.innerHeight;
+      let L=e.clientX-offX, T=e.clientY-offY;
+      L=Math.max(4, Math.min(vw-rect.width-4, L));
+      T=Math.max(4, Math.min(vh-rect.height-4, T));
+      tLeft=L; tTop=T;
+      if(!raf){ raf=true; requestAnimationFrame(apply); }
+    };
+    const onUp=(e)=>{
+      if(e.pointerId!==pid) return;
+      dragging=false; pid=null; handle.style.cursor="grab";
+      const top=tTop, left=tLeft;
+      game.settings.set(YTJ_ID, settingKey, {top,left});
+      window.removeEventListener("pointermove", onMove);
+    };
+    handle.addEventListener("pointerdown",(e)=>{
+      if(e.button!==0) return;
+      e.preventDefault();
+      dragging=true; pid=e.pointerId; handle.style.cursor="grabbing";
+      const rect=el.getBoundingClientRect();
+      offX=e.clientX-rect.left; offY=e.clientY-rect.top;
+      window.addEventListener("pointermove", onMove, { passive:true });
+      window.addEventListener("pointerup", onUp, { once:true });
+    });
+  },
+
+  attachHostToPanel(){
     this.ensure();
-    this.attachHostToPanel();
-    if (!this.isVisible){
-      this.panel.style.display = "block";
-      this.isVisible = true;
+    const body = this.panel?.children?.[1];
+    if (body && this.host && this.host.parentElement !== body){
+      try { body.appendChild(this.host); } catch {}
     }
   },
 
-  hide(){
-    if (this.panel){
-      this.panel.style.display = "none";
-      this.isVisible = false;
-    }
-  },
-
-  setPaused(paused){
-    if (!this.panel) return;
-    this.btnPlay.disabled  = !paused;
-    this.btnPause.disabled = paused;
-  }
+  show(){ this.ensure(); this.attachHostToPanel(); if (!this.isVisible){ this.panel.style.display="block"; this.isVisible=true; } },
+  hide(){ if (this.panel){ this.panel.style.display="none"; this.isVisible=false; } },
+  setPaused(paused){ if (!this.panel) return; this.btnPlay.disabled=!paused; this.btnPause.disabled=paused; }
 };
 
 /* ------------------------------- Socket ------------------------------- */
@@ -405,21 +530,29 @@ const YTJ_Player = {
   /* ---------- overlay ---------- */
   async mountOnceBg(){ if(this._mountedBg) return; this._mountedBg=true; this._ensureHostBg(); await this._loadAPI(); this._createBg(); await this.readyBg(); },
   _ensureHostBg(){
+    // ensure overlay mini panel and host inside it
+    YTJ_MiniBg.ensure();
     let host=document.getElementById("ytj-player-ol");
-    if(!host){ host=document.createElement("div"); host.id="ytj-player-ol"; host.setAttribute("aria-label","YouTube overlay player");
-      Object.assign(host.style,{ position:"fixed", right:"12px", bottom:"12px", width:"1px", height:"1px", border:"0", background:"#000", borderRadius:"2px", zIndex:"4000" });
-      document.body.appendChild(host);
+    if(!host){
+      host=document.createElement("div");
+      host.id="ytj-player-ol";
     }
+    Object.assign(host.style,{ width:"200px", height:"200px", border:"0", background:"#000", borderRadius:"2px" });
+    YTJ_MiniBg.attachHostToPanel();
   },
   _createBg(){
     const playerVars={ playsinline:1 }; if (location.protocol==="https:") playerVars.origin = location.origin;
     this._readyPromiseBg = new Promise(r=>this._readyResolveBg=r);
     this._playerBg = new YT.Player("ytj-player-ol", {
-      height:"1", width:"1", playerVars,
+      height:"200", width:"200", playerVars,
       events:{
         onReady:()=>{ try{ this._playerBg.setVolume(clamp0to100(Number(game.settings.get(YTJ_ID,"clientVolOverlay"))||40)); }catch{} this._readyResolveBg?.(true); },
         onError:(e)=>{ const c=Number(e?.data); const msg=(c===2)?"Invalid parameter." : (c===5)?"Playback error in browser." : (c===100)?"Video not found." : (c===101||c===150)?"Embedding disabled by owner." : "YouTube player failure."; ui.notifications?.error(`Overlay: ${msg}`); console.error("[ytj] YT overlay onError", e?.data); },
-        onStateChange:(ev)=>{ try{ if(ev?.data===YT.PlayerState.ENDED){ YTJ_State.bgActive=false; YTJ_UI.refresh(); } }catch{} }
+        onStateChange:(ev)=>{ try{
+          if(ev?.data===YT.PlayerState.ENDED){ YTJ_State.bgActive=false; YTJ_MiniBg.setPaused(false); YTJ_MiniBg.hide(); YTJ_UI.refresh(); }
+          else if(ev?.data===YT.PlayerState.PAUSED){ YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(true); }
+          else if(ev?.data===YT.PlayerState.PLAYING){ YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(false); }
+        }catch{} }
       }
     });
   },
@@ -432,14 +565,15 @@ const YTJ_Player = {
     try{
       this._playerBg.loadVideoById(videoId, start);
       setTimeout(()=>{ try{ this._playerBg.playVideo(); }catch{} },50);
+      YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(false);
       setTimeout(()=>{ try{
         const vd=this._playerBg.getVideoData?.()||{};
         if(vd.title){ const pos = YTJ_Library.findVideo(videoId); if(pos){ const item = YTJ_Library.getItem(pos.g,pos.i); if(item && (!item.title || item.title===item.id)){ item.title = vd.title; if(YTJ_State.canEditLibrary()) YTJ_Library.save(true); YTJ_UI.refresh(); } } }
       }catch{} },800);
     }catch(e){ console.error("[ytj] playBg error", e); ui.notifications?.error("Overlay: failed to start playback (see console)."); }
   },
-  async pauseBgAt(t){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); if(typeof t==="number") this._playerBg.seekTo(t,true);}catch{} },
-  async hardStopBg(){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); this._playerBg.seekTo(0,true);}catch{} },
+  async pauseBgAt(t){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); if(typeof t==="number") this._playerBg.seekTo(t,true);}catch{} YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(true); },
+  async hardStopBg(){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); this._playerBg.seekTo(0,true);}catch{} YTJ_MiniBg.hide(); },
   async seekBg(t){ await this.ensureBg(); try{ this._playerBg.seekTo(t,true);}catch{} },
   get timeBg(){ try{ return this._playerBg.getCurrentTime()||0; }catch{ return 0; } },
   setVolumeBg(v){ try{ this._playerBg?.setVolume?.(clamp0to100(Number(v)||0)); }catch{} }
@@ -1039,4 +1173,3 @@ const YTJ_App = {
 function clamp0to100(n){ n=Number(n)||0; if(n<0)return 0; if(n>100)return 100; return Math.round(n); }
 function randomId(len=8){ const c="abcdefghijklmnopqrstuvwxyz0123456789"; let s=""; for(let i=0;i<len;i++) s+=c[(Math.random()*c.length)|0]; return s; }
 function escapeHTML(s){ return String(s).replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[m])); }
-
