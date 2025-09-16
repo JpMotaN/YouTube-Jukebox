@@ -1,10 +1,12 @@
 /**
- * YouTube Jukebox – main.js v0.1.3
- * - Visible mini-player (200x200) for MAIN track (draggable, persistent).
- * - NEW: Visible mini-player (200x200) for OVERLAY track (draggable, persistent).
- * - Overlay improvements kept (Pause OL + per-client Overlay volume in FAB popover).
- * - Draggable FAB (per-client position persists). Volume popover follows the FAB.
- * - Configurable keybinding (default Ctrl/Cmd + K) via Foundry's Keybindings UI.
+ * YouTube Jukebox – main.js v0.1.4
+ * - Mini players (MAIN + OVERLAY) 200x200, draggable & persistent
+ * - NEW: Close (×) button on both mini players (stops and hides)
+ * - Stop now hides the corresponding mini player immediately (no second click)
+ * - Removed extra Pause/Play buttons from mini players (use YouTube controls)
+ * - Overlay improvements (per-client volume via FAB popover)
+ * - Draggable FAB with per-client position (volume popover follows)
+ * - Configurable keybinding (default Ctrl/Cmd + K) via Foundry's Keybindings UI
  */
 
 const YTJ_ID = "yt-jukebox";
@@ -60,7 +62,7 @@ Hooks.once("init", () => {
   game.keybindings.register(YTJ_ID, "toggleUI", {
     name: "Toggle YouTube Jukebox",
     hint: "Open/close the YouTube Jukebox panel.",
-    editable: [{ key: "KeyK", modifiers: ["CONTROL"] }], // Ctrl/Cmd+K (Cmd works on Mac automatically)
+    editable: [{ key: "KeyK", modifiers: ["CONTROL"] }],
     onDown: () => { YTJ_App.toggle(); return true; },
     restricted: false,
     precedence: CONST.KEYBINDING_PRECEDENCE.NORMAL
@@ -103,8 +105,6 @@ const YTJ_State = {
 const YTJ_Mini = {
   panel: null,
   host: null,   // #ytj-player container (main)
-  btnPlay: null,
-  btnPause: null,
   isVisible: false,
 
   ensure(){
@@ -131,7 +131,7 @@ const YTJ_Mini = {
       overflow: "hidden"
     });
 
-    // Header (draggable)
+    // Header (draggable) + Close
     const hdr = document.createElement("div");
     Object.assign(hdr.style, {
       display: "flex",
@@ -143,11 +143,9 @@ const YTJ_Mini = {
       cursor: "grab",
       userSelect: "none"
     });
-    hdr.innerHTML = `<div style="font-weight:600">YouTube Player</div>
-      <div style="display:flex; gap:6px">
-        <button id="ytj-mini-pause">Pause</button>
-        <button id="ytj-mini-play">Play</button>
-      </div>`;
+    hdr.innerHTML = `
+      <div style="font-weight:600">YouTube Player</div>
+      <button id="ytj-mini-close" title="Close player" style="min-width:22px;width:22px;height:22px;line-height:1;border-radius:6px;">×</button>`;
     el.appendChild(hdr);
 
     // Body (200x200)
@@ -180,12 +178,11 @@ const YTJ_Mini = {
     // Refs
     this.panel = el;
     this.host  = host;
-    this.btnPlay  = el.querySelector("#ytj-mini-play");
-    this.btnPause = el.querySelector("#ytj-mini-pause");
 
-    // Buttons
-    this.btnPlay.addEventListener("click", ()=> YTJ_Control.playSelected());
-    this.btnPause.addEventListener("click", ()=> YTJ_Control.pause());
+    // Close button
+    el.querySelector("#ytj-mini-close").addEventListener("click", ()=>{
+      YTJ_Control.stop(); // also hides panel (see stop)
+    });
 
     // Drag
     this._setupDrag(hdr, el, "miniPos");
@@ -235,16 +232,13 @@ const YTJ_Mini = {
   },
 
   show(){ this.ensure(); this.attachHostToPanel(); if (!this.isVisible){ this.panel.style.display="block"; this.isVisible=true; } },
-  hide(){ if (this.panel){ this.panel.style.display="none"; this.isVisible=false; } },
-  setPaused(paused){ if (!this.panel) return; this.btnPlay.disabled=!paused; this.btnPause.disabled=paused; }
+  hide(){ if (this.panel){ this.panel.style.display="none"; this.isVisible=false; } }
 };
 
 /* ------------------------------- Mini Player (OVERLAY, 200x200) ------------------------------- */
 const YTJ_MiniBg = {
   panel: null,
   host: null,   // #ytj-player-ol container (overlay)
-  btnPlay: null,
-  btnPause: null,
   isVisible: false,
 
   ensure(){
@@ -271,7 +265,7 @@ const YTJ_MiniBg = {
       overflow: "hidden"
     });
 
-    // Header (draggable)
+    // Header (draggable) + Close
     const hdr = document.createElement("div");
     Object.assign(hdr.style, {
       display: "flex",
@@ -283,11 +277,9 @@ const YTJ_MiniBg = {
       cursor: "grab",
       userSelect: "none"
     });
-    hdr.innerHTML = `<div style="font-weight:600">Overlay Player</div>
-      <div style="display:flex; gap:6px">
-        <button id="ytj-mini-ol-pause">Pause</button>
-        <button id="ytj-mini-ol-play">Play</button>
-      </div>`;
+    hdr.innerHTML = `
+      <div style="font-weight:600">Overlay Player</div>
+      <button id="ytj-mini-ol-close" title="Close overlay player" style="min-width:22px;width:22px;height:22px;line-height:1;border-radius:6px;">×</button>`;
     el.appendChild(hdr);
 
     // Body (200x200)
@@ -320,12 +312,11 @@ const YTJ_MiniBg = {
     // Refs
     this.panel = el;
     this.host  = host;
-    this.btnPlay  = el.querySelector("#ytj-mini-ol-play");
-    this.btnPause = el.querySelector("#ytj-mini-ol-pause");
 
-    // Buttons (overlay actions)
-    this.btnPlay.addEventListener("click", ()=> YTJ_Control.playOverlaySelected());
-    this.btnPause.addEventListener("click", ()=> YTJ_Control.pauseOverlay());
+    // Close button
+    el.querySelector("#ytj-mini-ol-close").addEventListener("click", ()=>{
+      YTJ_Control.stopOverlay(); // also hides panel (see stopOverlay)
+    });
 
     // Drag
     this._setupDrag(hdr, el, "miniPosOverlay");
@@ -375,8 +366,7 @@ const YTJ_MiniBg = {
   },
 
   show(){ this.ensure(); this.attachHostToPanel(); if (!this.isVisible){ this.panel.style.display="block"; this.isVisible=true; } },
-  hide(){ if (this.panel){ this.panel.style.display="none"; this.isVisible=false; } },
-  setPaused(paused){ if (!this.panel) return; this.btnPlay.disabled=!paused; this.btnPause.disabled=paused; }
+  hide(){ if (this.panel){ this.panel.style.display="none"; this.isVisible=false; } }
 };
 
 /* ------------------------------- Socket ------------------------------- */
@@ -391,13 +381,13 @@ const YTJ_Socket = {
       // main player
       case "play": (async()=>{ const {id,g,i,t}=p; await YTJ_Player.play(id,t); YTJ_State.g=g; YTJ_State.i=i; YTJ_State.paused=false; YTJ_State.stopped=false; if(YTJ_State.selG<0){YTJ_State.selG=g;YTJ_State.selI=i;} YTJ_UI.refresh(); })(); break;
       case "pause": (async()=>{ await YTJ_Player.pauseAt(p.t); YTJ_State.paused=true; YTJ_State.pausedTime=p.t ?? YTJ_Player.time; })(); break;
-      case "stop": (async()=>{ await YTJ_Player.hardStop(); YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true; })(); break;
+      case "stop": (async()=>{ await YTJ_Player.hardStop(true); YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true; })(); break;
       case "seek": (async()=>{ await YTJ_Player.seek(p.t); })(); break;
 
       // overlay player
       case "playBg": (async()=>{ const {id,g,i,t}=p; await YTJ_Player.playBg(id,t); YTJ_State.bgG=g; YTJ_State.bgI=i; YTJ_State.bgPaused=false; YTJ_State.bgActive=true; YTJ_UI.refresh(); })(); break;
       case "pauseBg": (async()=>{ await YTJ_Player.pauseBgAt(p.t); YTJ_State.bgPaused=true; YTJ_State.bgPausedTime=p.t ?? YTJ_Player.timeBg; YTJ_UI.refresh(); })(); break;
-      case "stopBg": (async()=>{ await YTJ_Player.hardStopBg(); YTJ_State.bgPaused=false; YTJ_State.bgPausedTime=0; YTJ_State.bgActive=false; YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_UI.refresh(); })(); break;
+      case "stopBg": (async()=>{ await YTJ_Player.hardStopBg(true); YTJ_State.bgPaused=false; YTJ_State.bgPausedTime=0; YTJ_State.bgActive=false; YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_UI.refresh(); })(); break;
       case "seekBg": (async()=>{ await YTJ_Player.seekBg(p.t); })(); break;
     }
   }
@@ -472,6 +462,9 @@ const YTJ_Library = {
 const YTJ_Player = {
   _mounted:false, _player:null, _readyPromise:null, _readyResolve:null,
   _mountedBg:false, _playerBg:null, _readyPromiseBg:null, _readyResolveBg:null,
+  // flags to avoid showing mini panel during STOP pause/seek
+  _suppressShowOnce:false,
+  _suppressShowOnceBg:false,
 
   /* ---------- main ---------- */
   async mountOnce(){ if(this._mounted) return; this._mounted=true; this._ensureHost(); await this._loadAPI(); this._create(); await this.ready(); },
@@ -488,7 +481,8 @@ const YTJ_Player = {
   },
   _loadAPI(){ if (window.YT?.Player) return Promise.resolve(); return new Promise(res=>{ const s=document.createElement("script"); s.src="https://www.youtube.com/iframe_api"; window.onYouTubeIframeAPIReady=()=>res(); document.head.appendChild(s); }); },
   _create(){
-    const playerVars={ playsinline:1 }; if (location.protocol==="https:") playerVars.origin = location.origin;
+    const playerVars={ playsinline:1, controls:1, modestbranding:1, rel:0 };
+    if (location.protocol==="https:") playerVars.origin = location.origin;
     this._readyPromise = new Promise(r=>this._readyResolve=r);
     this._player = new YT.Player("ytj-player", {
       height:"200", width:"200", playerVars,
@@ -496,9 +490,12 @@ const YTJ_Player = {
         onReady:()=>{ try{ this._player.setVolume(clamp0to100(Number(game.settings.get(YTJ_ID,"clientVol"))||40)); }catch{} this._readyResolve?.(true); },
         onError:(e)=>{ const c=Number(e?.data); const msg=(c===2)?"Invalid parameter." : (c===5)?"Playback error in browser." : (c===100)?"Video not found." : (c===101||c===150)?"Embedding disabled by owner." : "YouTube player failure."; ui.notifications?.error(`YouTube: ${msg}`); console.error("[ytj] YT onError", e?.data); },
         onStateChange:(ev)=>{ try{
-          if(ev?.data===YT.PlayerState.ENDED){ YTJ_Mini.setPaused(false); YTJ_Control._onEnded(); }
-          else if(ev?.data===YT.PlayerState.PAUSED){ YTJ_Mini.show(); YTJ_Mini.setPaused(true); }
-          else if(ev?.data===YT.PlayerState.PLAYING){ YTJ_Mini.show(); YTJ_Mini.setPaused(false); }
+          if(ev?.data===YT.PlayerState.ENDED){ YTJ_Control._onEnded(); }
+          else if(ev?.data===YT.PlayerState.PAUSED){
+            if (this._suppressShowOnce){ this._suppressShowOnce=false; return; }
+            YTJ_Mini.show();
+          }
+          else if(ev?.data===YT.PlayerState.PLAYING){ YTJ_Mini.show(); }
         }catch{} }
       }
     });
@@ -513,7 +510,7 @@ const YTJ_Player = {
       this._player.loadVideoById(videoId, start);
       setTimeout(()=>{ try{ this._player.playVideo(); }catch{} },50);
       // show mini
-      YTJ_Mini.show(); YTJ_Mini.setPaused(false);
+      YTJ_Mini.show();
       // backfill title later
       setTimeout(()=>{ try{
         const vd=this._player.getVideoData?.()||{};
@@ -521,8 +518,17 @@ const YTJ_Player = {
       }catch{} },800);
     }catch(e){ console.error("[ytj] play error", e); ui.notifications?.error("YouTube: failed to start playback (see console)."); }
   },
-  async pauseAt(t){ await this.ensure(); try{ this._player.pauseVideo(); if(typeof t==="number") this._player.seekTo(t,true);}catch{} YTJ_Mini.show(); YTJ_Mini.setPaused(true); },
-  async hardStop(){ await this.ensure(); try{ this._player.pauseVideo(); this._player.seekTo(0,true);}catch{} YTJ_Mini.hide(); },
+  async pauseAt(t){ await this.ensure(); try{ this._player.pauseVideo(); if(typeof t==="number") this._player.seekTo(t,true);}catch{} YTJ_Mini.show(); },
+  async hardStop(fromSocket=false){
+    await this.ensure();
+    try{
+      this._suppressShowOnce = true; // avoid PAUSED showing mini during stop sequence
+      this._player.pauseVideo();
+      this._player.seekTo(0,true);
+    }catch{}
+    // hide immediately on STOP
+    YTJ_Mini.hide();
+  },
   async seek(t){ await this.ensure(); try{ this._player.seekTo(t,true);}catch{} },
   get time(){ try{ return this._player.getCurrentTime()||0; }catch{ return 0; } },
   setVolume(v){ try{ this._player?.setVolume?.(clamp0to100(Number(v)||0)); }catch{} },
@@ -541,7 +547,8 @@ const YTJ_Player = {
     YTJ_MiniBg.attachHostToPanel();
   },
   _createBg(){
-    const playerVars={ playsinline:1 }; if (location.protocol==="https:") playerVars.origin = location.origin;
+    const playerVars={ playsinline:1, controls:1, modestbranding:1, rel:0 };
+    if (location.protocol==="https:") playerVars.origin = location.origin;
     this._readyPromiseBg = new Promise(r=>this._readyResolveBg=r);
     this._playerBg = new YT.Player("ytj-player-ol", {
       height:"200", width:"200", playerVars,
@@ -549,9 +556,12 @@ const YTJ_Player = {
         onReady:()=>{ try{ this._playerBg.setVolume(clamp0to100(Number(game.settings.get(YTJ_ID,"clientVolOverlay"))||40)); }catch{} this._readyResolveBg?.(true); },
         onError:(e)=>{ const c=Number(e?.data); const msg=(c===2)?"Invalid parameter." : (c===5)?"Playback error in browser." : (c===100)?"Video not found." : (c===101||c===150)?"Embedding disabled by owner." : "YouTube player failure."; ui.notifications?.error(`Overlay: ${msg}`); console.error("[ytj] YT overlay onError", e?.data); },
         onStateChange:(ev)=>{ try{
-          if(ev?.data===YT.PlayerState.ENDED){ YTJ_State.bgActive=false; YTJ_MiniBg.setPaused(false); YTJ_MiniBg.hide(); YTJ_UI.refresh(); }
-          else if(ev?.data===YT.PlayerState.PAUSED){ YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(true); }
-          else if(ev?.data===YT.PlayerState.PLAYING){ YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(false); }
+          if(ev?.data===YT.PlayerState.ENDED){ YTJ_State.bgActive=false; YTJ_MiniBg.hide(); YTJ_UI.refresh(); }
+          else if(ev?.data===YT.PlayerState.PAUSED){
+            if (this._suppressShowOnceBg){ this._suppressShowOnceBg=false; return; }
+            YTJ_MiniBg.show();
+          }
+          else if(ev?.data===YT.PlayerState.PLAYING){ YTJ_MiniBg.show(); }
         }catch{} }
       }
     });
@@ -565,15 +575,23 @@ const YTJ_Player = {
     try{
       this._playerBg.loadVideoById(videoId, start);
       setTimeout(()=>{ try{ this._playerBg.playVideo(); }catch{} },50);
-      YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(false);
+      YTJ_MiniBg.show();
       setTimeout(()=>{ try{
         const vd=this._playerBg.getVideoData?.()||{};
         if(vd.title){ const pos = YTJ_Library.findVideo(videoId); if(pos){ const item = YTJ_Library.getItem(pos.g,pos.i); if(item && (!item.title || item.title===item.id)){ item.title = vd.title; if(YTJ_State.canEditLibrary()) YTJ_Library.save(true); YTJ_UI.refresh(); } } }
       }catch{} },800);
     }catch(e){ console.error("[ytj] playBg error", e); ui.notifications?.error("Overlay: failed to start playback (see console)."); }
   },
-  async pauseBgAt(t){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); if(typeof t==="number") this._playerBg.seekTo(t,true);}catch{} YTJ_MiniBg.show(); YTJ_MiniBg.setPaused(true); },
-  async hardStopBg(){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); this._playerBg.seekTo(0,true);}catch{} YTJ_MiniBg.hide(); },
+  async pauseBgAt(t){ await this.ensureBg(); try{ this._playerBg.pauseVideo(); if(typeof t==="number") this._playerBg.seekTo(t,true);}catch{} YTJ_MiniBg.show(); },
+  async hardStopBg(fromSocket=false){
+    await this.ensureBg();
+    try{
+      this._suppressShowOnceBg = true; // avoid overlay mini showing during stop sequence
+      this._playerBg.pauseVideo();
+      this._playerBg.seekTo(0,true);
+    }catch{}
+    YTJ_MiniBg.hide();
+  },
   async seekBg(t){ await this.ensureBg(); try{ this._playerBg.seekTo(t,true);}catch{} },
   get timeBg(){ try{ return this._playerBg.getCurrentTime()||0; }catch{ return 0; } },
   setVolumeBg(v){ try{ this._playerBg?.setVolume?.(clamp0to100(Number(v)||0)); }catch{} }
@@ -650,7 +668,7 @@ const YTJ_Control = {
   },
 
   pause(){ if(!this._assertCtrl()) return; const t=YTJ_Player.time; YTJ_State.paused=true; YTJ_State.pausedTime=t; YTJ_State.stopped=false; YTJ_Socket.emit({cmd:"pause", t}); YTJ_Player.pauseAt(t); },
-  stop(){ if(!this._assertCtrl()) return; YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true; YTJ_Socket.emit({cmd:"stop"}); YTJ_Player.hardStop(); },
+  stop(){ if(!this._assertCtrl()) return; YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true; YTJ_Socket.emit({cmd:"stop"}); YTJ_Player.hardStop(); YTJ_Mini.hide(); },
   seek(t){ if(!this._assertCtrl()) return; YTJ_Socket.emit({cmd:"seek", t}); YTJ_Player.seek(t); },
   next(){ if(!this._assertCtrl()) return; const pos=(YTJ_State.g>=0&&YTJ_State.i>=0)?{g:YTJ_State.g,i:YTJ_State.i}:YTJ_Library.firstPos(); if(pos.g<0) return; const n=YTJ_Library.nextPos(pos.g,pos.i); if(n) this.playAt(n.g,n.i); },
   prev(){ if(!this._assertCtrl()) return; const pos=(YTJ_State.g>=0&&YTJ_State.i>=0)?{g:YTJ_State.g,i:YTJ_State.i}:YTJ_Library.firstPos(); if(pos.g<0) return; const p=YTJ_Library.prevPos(pos.g,pos.i); if(p) this.playAt(p.g,p.i); },
@@ -678,7 +696,7 @@ const YTJ_Control = {
   stopOverlay(){
     if(!this._assertCtrl()) return;
     YTJ_State.bgPaused=false; YTJ_State.bgPausedTime=0; YTJ_State.bgActive=false;
-    YTJ_Socket.emit({cmd:"stopBg"}); YTJ_Player.hardStopBg(); YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_UI.refresh();
+    YTJ_Socket.emit({cmd:"stopBg"}); YTJ_Player.hardStopBg(); YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_MiniBg.hide(); YTJ_UI.refresh();
   },
 
   moveItem(fromG, fromI, toG){
@@ -735,7 +753,7 @@ const YTJ_Data = {
   }
 };
 
-/* ------------------------------- UI ------------------------------- */
+/* ------------------------------- UI (main window) ------------------------------- */
 const YTJ_UI = {
   app:null,
   ensureApp(){ if(!this.app) this.app=new YTJ_AppClass(); return this.app; },
@@ -744,7 +762,6 @@ const YTJ_UI = {
   refresh(){ try{ this.app?.render(false); }catch{} },
 
   createFabWithVolume(){
-    // Ler posição salva
     const pos = game.settings.get(YTJ_ID, "fabPos") || { top:10, left:56 };
 
     // FAB
