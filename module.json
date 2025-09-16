@@ -2,7 +2,7 @@
   "id": "yt-jukebox",
   "title": "YouTube Jukebox",
   "description": "Toque playlists do YouTube sincronizadas para todos (jogadores & mestres). Suporte a link de vídeo ou playlist.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "authors": [
     {
       "name": "Jotape",
@@ -37,6 +37,7 @@
   "download": "https://github.com/JpMotaN/YouTube-Jukebox/archive/refs/heads/main.zip"
 
 }
+
 
 
 
