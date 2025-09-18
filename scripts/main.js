@@ -1,12 +1,22 @@
 /**
- * YouTube Jukebox – main.js v0.1.4
+ * YouTube Jukebox – main.js v0.2.0
  * - Mini players (MAIN + OVERLAY) 200x200, draggable & persistent
- * - NEW: Close (×) button on both mini players (stops and hides)
- * - Stop now hides the corresponding mini player immediately (no second click)
+ * - Close (×) button on both mini players (stops and hides)
+ * - Stop now hides the corresponding mini player immediately
  * - Removed extra Pause/Play buttons from mini players (use YouTube controls)
  * - Overlay improvements (per-client volume via FAB popover)
  * - Draggable FAB with per-client position (volume popover follows)
  * - Configurable keybinding (default Ctrl/Cmd + K) via Foundry's Keybindings UI
+ * - NEW: Search box (filters by title/id)
+ * - NEW: Favorites (★) + “Favorites only” filter
+ * - NEW: Clear All (per playlist)
+ * - NEW: Loop/Repeat: off / track / playlist
+ * - NEW: Drag & drop real entre playlists
+ * - NEW: Import/Export da biblioteca (JSON)
+ * - NEW: Permissão “players podem adicionar URLs”
+ * - NEW: Modo privado (playback local sem socket)
+ * - NEW: API para macros/scripts (play/pause/next/prev/stop)
+ * - NEW: Hotkeys extras (Play/Pause, Next)
  */
 
 const YTJ_ID = "yt-jukebox";
@@ -58,6 +68,19 @@ Hooks.once("init", () => {
     scope: "client", config: false, type: Object, default: { top: 120, left: 350 }
   });
 
+  // NEW: players podem adicionar?
+  game.settings.register(YTJ_ID, "canPlayersAdd", {
+    name: "Players can add URLs",
+    scope: "world", config: true, type: Boolean, default: true
+  });
+
+  // NEW: modo privado (sem socket, só local)
+  game.settings.register(YTJ_ID, "privateMode", {
+    name: "Private playback (this client only)",
+    hint: "If enabled, play/pause/next will NOT broadcast via socket.",
+    scope: "client", config: true, type: Boolean, default: false
+  });
+
   // Keybinding (configurable in Foundry's Keybindings UI)
   game.keybindings.register(YTJ_ID, "toggleUI", {
     name: "Toggle YouTube Jukebox",
@@ -66,6 +89,18 @@ Hooks.once("init", () => {
     onDown: () => { YTJ_App.toggle(); return true; },
     restricted: false,
     precedence: CONST.KEYBINDING_PRECEDENCE.NORMAL
+  });
+
+  // NEW: hotkeys extras
+  game.keybindings.register(YTJ_ID, "playPause", {
+    name: "Play/Pause",
+    editable: [{key:"Space"}],
+    onDown: ()=>{ YTJ_State.paused ? YTJ_Control.playSelected() : YTJ_Control.pause(); return true; }
+  });
+  game.keybindings.register(YTJ_ID, "next", {
+    name: "Next track",
+    editable: [{key:"ArrowRight", modifiers:["SHIFT"]}],
+    onDown: ()=>{ YTJ_Control.next(); return true; }
   });
 });
 
@@ -78,7 +113,23 @@ Hooks.once("ready", () => {
     open: () => YTJ_App.toggle(true),
     close: () => YTJ_App.close(),
     toggle: () => YTJ_App.toggle(),
-    play: (videoId) => { const pos = YTJ_Library.findVideo(videoId); if (pos) YTJ_Control.playAt(pos.g, pos.i); },
+    play: (queryOrId) => {
+      // id direto?
+      const posById = YTJ_Library.findVideo(queryOrId);
+      if (posById) return YTJ_Control.playAt(posById.g, posById.i);
+      // por nome aproximado
+      const G=YTJ_Library.data.groups;
+      const q=String(queryOrId||"").toLowerCase();
+      for (let gi=0; gi<G.length; gi++){
+        const ii = G[gi].items.findIndex(x=> (x.title||"").toLowerCase().includes(q));
+        if (ii>=0) return YTJ_Control.playAt(gi,ii);
+      }
+      ui.notifications?.warn("Track not found.");
+    },
+    pause: () => YTJ_Control.pause(),
+    stop: () => YTJ_Control.stop(),
+    next: () => YTJ_Control.next(),
+    prev: () => YTJ_Control.prev(),
     setVolume: (v) => { YTJ_Player.setVolume(v); },
     setOverlayVolume: (v) => { YTJ_Player.setVolumeBg(v); }
   };
@@ -95,6 +146,11 @@ const YTJ_State = {
   // overlay
   bgG: -1, bgI: -1,
   bgPaused: false, bgPausedTime: 0, bgActive: false,
+
+  // NEW: UI states
+  searchText: "",
+  favOnly: false,
+  loopMode: "off", // "off" | "one" | "all"
 
   controller: () => (game.settings.get(YTJ_ID, "controller") !== "gm" || game.user?.isGM),
   canEditLibrary: () => !!game.user?.isGM,
@@ -405,7 +461,7 @@ const YTJ_Library = {
   async save(broadcast=true){
     if (!YTJ_State.canEditLibrary()) return;
     await game.settings.set(YTJ_ID,"library", this.data);
-    if (broadcast) YTJ_Socket.emit({ cmd:"lib-set", lib:this.data });
+    if (broadcast && !game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit({ cmd:"lib-set", lib:this.data });
   },
 
   applyRemote(lib){
@@ -429,7 +485,7 @@ const YTJ_Library = {
   renameGroup(gi, name){ const g=this.data.groups[gi]; if(!g) return; g.name = String(name||"").trim() || g.name; },
   toggleCollapsed(gi){ const g=this.data.groups[gi]; if(!g) return; g.collapsed=!g.collapsed; },
 
-  addItemTo(gi, item){ const g=this.data.groups[gi]; if(!g||!item?.id) return; if(!g.items.some(x=>x.id===item.id)) g.items.push({ id:item.id, title:item.title||item.id }); },
+  addItemTo(gi, item){ const g=this.data.groups[gi]; if(!g||!item?.id) return; if(!g.items.some(x=>x.id===item.id)) g.items.push({ id:item.id, title:item.title||item.id, fav:false }); },
   deleteItem(gi, ii){ const g=this.data.groups[gi]; if(!g) return; g.items.splice(ii,1); },
 
   moveItem(fromG, fromI, toG){
@@ -602,9 +658,12 @@ const YTJ_Control = {
   _assertCtrl(){ if(!YTJ_State.controller()){ ui.notifications?.warn("You don't have permission to control the jukebox (check module settings)."); return false; } return true; },
 
   async loadUrl(url){
+    if (!YTJ_State.canEditLibrary() && !game.settings.get(YTJ_ID,"canPlayersAdd"))
+      return ui.notifications?.warn("You cannot add tracks.");
     const parsed = YTJ_Util.parse(url);
     if(!parsed){ ui.notifications?.error("Invalid YouTube link."); return; }
-    if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only the GM can modify the saved library.");
+    if(!YTJ_State.canEditLibrary() && parsed.playlist)
+      return ui.notifications?.warn("Only the GM can import playlists.");
 
     if(parsed.playlist){
       const plName = (await YTJ_Data.fetchPlaylistTitle(parsed.playlist)) || `Playlist ${parsed.playlist.slice(0,6)}`;
@@ -648,13 +707,15 @@ const YTJ_Control = {
       const it = YTJ_Library.getItem(g,i); if(!it) return;
       const t0=Math.max(0, YTJ_State.pausedTime||0); const startedAt = Date.now()-Math.floor(t0*1000);
       const payload={cmd:"play", id:it.id, g, i, t:startedAt}; YTJ_State.paused=false; YTJ_State.stopped=false;
-      YTJ_Socket.emit(payload); YTJ_Player.play(it.id, startedAt); YTJ_UI.refresh(); return;
+      if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit(payload);
+      YTJ_Player.play(it.id, startedAt); YTJ_UI.refresh(); return;
     }
 
     if(YTJ_State.stopped && g===YTJ_State.g && i===YTJ_State.i){
       const it = YTJ_Library.getItem(g,i); if(!it) return;
       const payload={cmd:"play", id:it.id, g, i, t:Date.now()}; YTJ_State.stopped=false; YTJ_State.paused=false; YTJ_State.pausedTime=0;
-      YTJ_Socket.emit(payload); YTJ_Player.play(it.id, payload.t); YTJ_UI.refresh(); return;
+      if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit(payload);
+      YTJ_Player.play(it.id, payload.t); YTJ_UI.refresh(); return;
     }
 
     this.playAt(g,i);
@@ -664,15 +725,42 @@ const YTJ_Control = {
     if(!this._assertCtrl()) return;
     const it = YTJ_Library.getItem(g,i); if(!it) return;
     YTJ_State.g=g; YTJ_State.i=i; YTJ_State.selG=g; YTJ_State.selI=i; YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=false;
-    const payload={cmd:"play", id:it.id, g, i, t:Date.now()}; YTJ_Socket.emit(payload); YTJ_Player.play(it.id, payload.t); YTJ_UI.refresh();
+    const payload={cmd:"play", id:it.id, g, i, t:Date.now()};
+    if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit(payload);
+    YTJ_Player.play(it.id, payload.t); YTJ_UI.refresh();
   },
 
-  pause(){ if(!this._assertCtrl()) return; const t=YTJ_Player.time; YTJ_State.paused=true; YTJ_State.pausedTime=t; YTJ_State.stopped=false; YTJ_Socket.emit({cmd:"pause", t}); YTJ_Player.pauseAt(t); },
-  stop(){ if(!this._assertCtrl()) return; YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true; YTJ_Socket.emit({cmd:"stop"}); YTJ_Player.hardStop(); YTJ_Mini.hide(); },
-  seek(t){ if(!this._assertCtrl()) return; YTJ_Socket.emit({cmd:"seek", t}); YTJ_Player.seek(t); },
+  pause(){
+    if(!this._assertCtrl()) return;
+    const t=YTJ_Player.time; YTJ_State.paused=true; YTJ_State.pausedTime=t; YTJ_State.stopped=false;
+    if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit({cmd:"pause", t});
+    YTJ_Player.pauseAt(t);
+  },
+  stop(){
+    if(!this._assertCtrl()) return;
+    YTJ_State.paused=false; YTJ_State.pausedTime=0; YTJ_State.stopped=true;
+    if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit({cmd:"stop"});
+    YTJ_Player.hardStop(); YTJ_Mini.hide();
+  },
+  seek(t){ if(!this._assertCtrl()) return; if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit({cmd:"seek", t}); YTJ_Player.seek(t); },
   next(){ if(!this._assertCtrl()) return; const pos=(YTJ_State.g>=0&&YTJ_State.i>=0)?{g:YTJ_State.g,i:YTJ_State.i}:YTJ_Library.firstPos(); if(pos.g<0) return; const n=YTJ_Library.nextPos(pos.g,pos.i); if(n) this.playAt(n.g,n.i); },
   prev(){ if(!this._assertCtrl()) return; const pos=(YTJ_State.g>=0&&YTJ_State.i>=0)?{g:YTJ_State.g,i:YTJ_State.i}:YTJ_Library.firstPos(); if(pos.g<0) return; const p=YTJ_Library.prevPos(pos.g,pos.i); if(p) this.playAt(p.g,p.i); },
-  _onEnded(){ const n=YTJ_Library.nextPos(YTJ_State.g,YTJ_State.i); if(n) this.playAt(n.g,n.i); },
+
+  // respeita Loop/Repeat
+  _onEnded(){
+    const mode = YTJ_State.loopMode;
+    if (mode === "one"){
+      if (YTJ_State.g>=0 && YTJ_State.i>=0) this.playAt(YTJ_State.g, YTJ_State.i);
+      return;
+    }
+    if (mode === "all"){
+      const n = YTJ_Library.nextPos(YTJ_State.g, YTJ_State.i) || YTJ_Library.firstPos();
+      if (n) this.playAt(n.g, n.i);
+      return;
+    }
+    const n=YTJ_Library.nextPos(YTJ_State.g,YTJ_State.i);
+    if(n) this.playAt(n.g,n.i);
+  },
 
   /* ----- OVERLAY ----- */
   playOverlaySelected(){
@@ -680,7 +768,9 @@ const YTJ_Control = {
     let { selG:g, selI:i } = YTJ_State; if(g<0||i<0) ({g,i}=YTJ_Library.firstPos()); if(g<0) return;
     const it = YTJ_Library.getItem(g,i); if(!it) return;
     YTJ_State.bgG = g; YTJ_State.bgI = i; YTJ_State.bgPaused=false; YTJ_State.bgActive=true;
-    const payload={cmd:"playBg", id:it.id, g, i, t:Date.now()}; YTJ_Socket.emit(payload); YTJ_Player.playBg(it.id, payload.t);
+    const payload={cmd:"playBg", id:it.id, g, i, t:Date.now()};
+    if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit(payload);
+    YTJ_Player.playBg(it.id, payload.t);
     const v = clamp0to100(Number(game.settings.get(YTJ_ID,"clientVolOverlay"))||40);
     YTJ_Player.setVolumeBg(v);
     YTJ_UI.refresh();
@@ -690,13 +780,15 @@ const YTJ_Control = {
     if(!this._assertCtrl()) return;
     const t = YTJ_Player.timeBg;
     YTJ_State.bgPaused=true; YTJ_State.bgPausedTime=t;
-    YTJ_Socket.emit({cmd:"pauseBg", t}); YTJ_Player.pauseBgAt(t); YTJ_UI.refresh();
+    if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit({cmd:"pauseBg", t});
+    YTJ_Player.pauseBgAt(t); YTJ_UI.refresh();
   },
 
   stopOverlay(){
     if(!this._assertCtrl()) return;
     YTJ_State.bgPaused=false; YTJ_State.bgPausedTime=0; YTJ_State.bgActive=false;
-    YTJ_Socket.emit({cmd:"stopBg"}); YTJ_Player.hardStopBg(); YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_MiniBg.hide(); YTJ_UI.refresh();
+    if (!game.settings.get(YTJ_ID,"privateMode")) YTJ_Socket.emit({cmd:"stopBg"});
+    YTJ_Player.hardStopBg(); YTJ_State.bgG=-1; YTJ_State.bgI=-1; YTJ_MiniBg.hide(); YTJ_UI.refresh();
   },
 
   moveItem(fromG, fromI, toG){
@@ -710,7 +802,7 @@ const YTJ_Control = {
 const YTJ_Data = {
   async loadPlaylist(plId){
     const key=String(game.settings.get(YTJ_ID,"apiKey")||"").trim();
-    if(!key){ const ids=await this._idsFromIframe(plId); return ids.map(id=>({id,title:id})); }
+    if(!key){ const ids=await this._idsFromIframe(plId); return ids.map(id=>({id,title:id,fav:false})); }
 
     const items=[]; let pageToken="";
     while(true){
@@ -720,7 +812,7 @@ const YTJ_Data = {
       if(pageToken) url.searchParams.set("pageToken", pageToken);
       const r=await fetch(url.toString()); if(!r.ok) throw new Error("YouTube API error");
       const j=await r.json();
-      for(const it of (j.items||[])){ const id=it.contentDetails?.videoId; const title=it.snippet?.title||id; if(id) items.push({id,title}); }
+      for(const it of (j.items||[])){ const id=it.contentDetails?.videoId; const title=it.snippet?.title||id; if(id) items.push({id,title,fav:false}); }
       pageToken=j.nextPageToken||""; if(!pageToken) break;
     }
     return items;
@@ -921,7 +1013,7 @@ const YTJ_UI = {
 class YTJ_AppClass extends Application {
   static get defaultOptions(){
     return foundry.utils.mergeObject(super.defaultOptions,{
-      id:"ytj-app", title:"YouTube Jukebox", popOut:true, width:720, height:560, resizable:true, classes:["ytj-app"], template:""
+      id:"ytj-app", title:"YouTube Jukebox", popOut:true, width:820, height:600, resizable:true, classes:["ytj-app"], template:""
     });
   }
 
@@ -931,17 +1023,49 @@ class YTJ_AppClass extends Application {
       <style>
         #ytj-app .window-content{ padding:0 !important; }
         .ytj-root{ min-height:100%; display:flex; flex-direction:column; }
-        .ytj-top{ position:sticky; top:0; z-index:3; background:var(--color-bg,#f0f0f0);
-                  border-bottom:1px solid var(--color-border-light-tertiary); box-shadow:0 2px 6px rgba(0,0,0,.12); }
-        .ytj-header{ display:flex; gap:8px; align-items:center; padding:10px 10px 6px; }
-        .ytj-input{ flex:1; height:34px; padding:0 10px; font-size:13px; }
+        .ytj-top{
+          position:sticky; top:0; z-index:3;
+          background:var(--color-bg,#f0f0f0);
+          border-bottom:1px solid var(--color-border-light-tertiary);
+          box-shadow:0 2px 6px rgba(0,0,0,.12);
+          overflow:visible;
+        }
 
-        .ytj-ctrls{ display:flex; gap:6px; align-items:center; padding:6px 10px 10px;
-                    flex-wrap:nowrap; overflow-x:auto; white-space:nowrap; }
-        .ytj-ctrls button{ margin-right:6px; }
+        /* linha 1: url + busca + favoritos */
+        .ytj-header-row1{
+          display:flex; align-items:center; gap:8px;
+          padding:10px 10px 6px;
+          flex-wrap:wrap;
+        }
+        .ytj-input{ flex:1 1 280px; height:34px; padding:0 10px; font-size:13px; }
+        .ytj-search{ flex:1 1 280px; height:34px; padding:0 10px; font-size:13px; }
+        .ytj-fav{ display:flex; align-items:center; gap:6px; white-space:nowrap; }
 
+        /* linha 2: toolbar – tudo lado a lado */
+        .ytj-toolbar{
+          display:flex; align-items:center; gap:8px;
+          padding:6px 10px 10px;
+          flex-wrap:wrap;
+        }
+
+        /* override do Foundry que alarga botões/inputs */
+        .ytj-toolbar button,
+        .ytj-toolbar .btn,
+        .ytj-toolbar label,
+        .ytj-toolbar select,
+        .ytj-toolbar input[type="checkbox"],
+        .ytj-header-row1 button {
+          width:auto !important;
+          min-width:unset !important;
+          display:inline-flex !important;
+          flex:0 0 auto !important;
+        }
+        .ytj-toolbar select{ height:32px; }
+
+        .ytj-spacer{ flex:1 1 auto; }
+
+        /* conteúdo/listas (inalterado) */
         .ytj-content{ padding:10px; display:flex; flex-direction:column; gap:10px; }
-
         .ytj-group{ border:1px solid var(--color-border-light-tertiary); border-radius:10px; overflow:hidden; background:rgba(0,0,0,0.03); }
         .ytj-group-header{ display:flex; align-items:center; gap:6px; padding:6px 8px; background:rgba(0,0,0,0.04); }
         .ytj-group-header .icon{ width:22px; height:22px; display:inline-flex; align-items:center; justify-content:center;
@@ -966,7 +1090,6 @@ class YTJ_AppClass extends Application {
         .ytj-item.playing{ background:var(--color-bg-option); }
         .ytj-item.overlaying{ outline:2px solid rgba(255,210,50,.85); box-shadow:0 0 0 3px rgba(255,210,50,.25) inset; }
 
-        /* Move modal */
         .ytj-modal-back{ position:fixed; inset:0; background:rgba(0,0,0,.4); z-index:9998; }
         .ytj-modal{ position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:9999; }
         .ytj-modal .card{ background:var(--color-bg,#1e1e1e); border:1px solid var(--color-border-light-tertiary);
@@ -980,20 +1103,43 @@ class YTJ_AppClass extends Application {
       ${style}
       <div class="ytj-root">
         <div class="ytj-top">
-          <div class="ytj-header">
+          <!-- Row 1 -->
+          <div class="ytj-header-row1">
             <input id="ytj-url" class="ytj-input" placeholder="Paste a YouTube video or playlist URL…" />
+            <input id="ytj-search" class="ytj-search" placeholder="Search in library… (title/id)" value="${escapeHTML(YTJ_State.searchText)}" />
+            <label class="ytj-fav">
+              <input id="ytj-favOnly" type="checkbox" ${YTJ_State.favOnly ? "checked" : ""}/>
+              <span>Favorites only</span>
+            </label>
+          </div>
+
+          <!-- Row 2: toolbar única -->
+          <div class="ytj-toolbar">
             <button id="ytj-join">Enable Audio</button>
             <button id="ytj-load">Add</button>
             <button id="ytj-newgrp" title="Create empty group">New Group</button>
-          </div>
-          <div class="ytj-ctrls">
+            <button id="ytj-export" title="Export library to JSON">Export</button>
+            <button id="ytj-import" title="Import library from JSON">Import</button>
+            <input type="file" id="ytj-import-file" accept="application/json" style="display:none" />
+
+            <div class="ytj-spacer"></div>
+
             <button id="ytj-prev">Previous</button>
             <button id="ytj-play">Play</button>
             <button id="ytj-pause">Pause</button>
             <button id="ytj-stop">Stop</button>
             <button id="ytj-next">Next</button>
             <button id="ytj-sync">Sync</button>
-            <span style="width:1px;height:18px;background:var(--color-border-light-tertiary);display:inline-block;margin:0 8px;"></span>
+
+            <label style="display:flex;align-items:center;gap:6px;">
+              <span>Loop:</span>
+              <select id="ytj-loopSel">
+                <option value="off" ${YTJ_State.loopMode==="off"?"selected":""}>Off</option>
+                <option value="one" ${YTJ_State.loopMode==="one"?"selected":""}>Track</option>
+                <option value="all" ${YTJ_State.loopMode==="all"?"selected":""}>Playlist</option>
+              </select>
+            </label>
+
             <button id="ytj-play-ol" title="Play selected as overlay (simultaneous)">Overlay</button>
             <button id="ytj-pause-ol" title="Pause overlay only">Pause OL</button>
             <button id="ytj-stop-ol" title="Stop overlay only">Stop OL</button>
@@ -1009,13 +1155,92 @@ class YTJ_AppClass extends Application {
     return $(root);
   }
 
+  // Filtro “ao vivo” (sem re-render, mantém foco)
+  filterLibrary(query, favOnly = YTJ_State.favOnly) {
+    const q = String(query || "").toLowerCase().trim();
+    const $root = this.element;
+
+    // filtra itens
+    $root.find(".ytj-item").each((_, el) => {
+      const title = (el.querySelector(".t")?.textContent || "").toLowerCase();
+      const id    = (el.querySelector(".m")?.textContent || "").toLowerCase();
+      const isFav = el.querySelector(".mini.fav")?.classList.contains("active");
+      const byText = !q || title.includes(q) || id.includes(q);
+      const byFav  = !favOnly || !!isFav;
+      el.style.display = (byText && byFav) ? "" : "none";
+    });
+
+    // esconde/mostra grupos vazios pós-filtro
+    $root.find(".ytj-group").each((_, g) => {
+      const body = g.querySelector(".ytj-group-items");
+      const anyVisible = !!body?.querySelector(".ytj-item:not([style*='display: none'])");
+      g.style.display = anyVisible || !q ? "" : "none";
+      // contador dinâmico quando filtrando
+      const cnt = g.querySelector(".ytj-group-header .count");
+      if (cnt) {
+        if (q || favOnly) {
+          const vis = body?.querySelectorAll(".ytj-item:not([style*='display: none'])").length ?? 0;
+          cnt.textContent = String(vis);
+        } else {
+          // volta ao total real do grupo (re-render repõe corretamente)
+          // aqui não alteramos o valor original
+        }
+      }
+    });
+  }
+
   activateListeners(html){
     super.activateListeners(html);
+
+    // SEARCH: sem re-render (mantém foco)
+    const $search = html.find("#ytj-search");
+    $search.on("input", (ev)=>{
+      YTJ_State.searchText = String(ev.currentTarget.value || "");
+      this.filterLibrary(YTJ_State.searchText);   // aplica em tempo real
+    });
+
+    // FAVORITES ONLY: sem re-render
+    const $favOnly = html.find("#ytj-favOnly");
+    $favOnly.on("change", (ev)=>{
+      YTJ_State.favOnly = !!ev.currentTarget.checked;
+      this.filterLibrary(YTJ_State.searchText, YTJ_State.favOnly);
+    });
+
+    // LOOP
+    html.find("#ytj-loopSel").on("change",(ev)=>{ YTJ_State.loopMode = ev.currentTarget.value; });
 
     html.find("#ytj-load").on("click", async ()=>{
       const v = String(html.find("#ytj-url").val()||"").trim(); if(!v) return;
       await YTJ_Control.loadUrl(v);
       html.find("#ytj-url").val("");
+    });
+
+    // import/export
+    html.find("#ytj-export").on("click", ()=>{
+      const blob = new Blob([JSON.stringify(YTJ_Library.data, null, 2)], {type:"application/json"});
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `ytj-library-${Date.now()}.json`;
+      a.click();
+      setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+    });
+    html.find("#ytj-import").on("click", ()=> html.find("#ytj-import-file")[0].click());
+    html.find("#ytj-import-file").on("change", async (ev)=>{
+      const f = ev.currentTarget.files?.[0]; if(!f) return;
+      const txt = await f.text();
+      try{
+        const data = JSON.parse(txt);
+        if (!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can import.");
+        if (Array.isArray(data?.groups)){
+          YTJ_Library.data.groups.push(...data.groups);
+          await YTJ_Library.save(true);
+          YTJ_UI.refresh();
+          ui.notifications?.info("Library imported.");
+        } else {
+          ui.notifications?.error("Invalid file.");
+        }
+      }catch{ ui.notifications?.error("Invalid JSON file."); }
+      ev.currentTarget.value = "";
     });
 
     html.find("#ytj-join").on("click", ()=>Promise.all([YTJ_Player.ensure(), YTJ_Player.ensureBg()]).then(()=>ui.notifications?.info("Audio enabled on this client.")));
@@ -1046,14 +1271,34 @@ class YTJ_AppClass extends Application {
         <button class="icon toggle" title="${grp.collapsed?"Expand":"Collapse"}"><i class="fas ${grp.collapsed?"fa-chevron-right":"fa-chevron-down"}"></i></button>
         <div class="name" title="Double-click to rename" contenteditable="false">${escapeHTML(grp.name)}</div>
         <div class="count" title="Items in group">${grp.items.length}</div>
+        <button class="icon cleargrp" title="Clear all items"><i class="fas fa-broom"></i></button>
         <button class="icon delgrp" title="Delete group"><i class="fas fa-trash"></i></button>
       `;
       wrapG.appendChild(hdr);
 
       const body=document.createElement("div"); body.className="ytj-group-items"; body.style.display=grp.collapsed?"none":"grid";
 
+      // drag target (destino)
+      body.addEventListener("dragover", (e)=>{ e.preventDefault(); body.classList.add("drop-target"); });
+      body.addEventListener("dragleave", ()=> body.classList.remove("drop-target"));
+      body.addEventListener("drop", (e)=>{
+        e.preventDefault(); body.classList.remove("drop-target");
+        const data = e.dataTransfer.getData("text/plain");
+        if (!data) return;
+        try {
+          const { fromG, fromI } = JSON.parse(data);
+          if (typeof fromG!=="number" || typeof fromI!=="number") return;
+          if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can move tracks.");
+          if (fromG===gi) return; // não reordena no mesmo grupo (por enquanto)
+          YTJ_Control.moveItem(fromG, fromI, gi);
+        } catch {}
+      });
+
       grp.items.forEach((it, ii)=>{
+        // (render normal; o filtro é aplicado depois via filterLibrary)
         const el=document.createElement("div"); el.className="ytj-item";
+        el.draggable = true; // drag source
+
         if(gi===YTJ_State.selG && ii===YTJ_State.selI) el.classList.add("selected");
         if(gi===YTJ_State.g && ii===YTJ_State.i) el.classList.add("playing");
         if(gi===YTJ_State.bgG && ii===YTJ_State.bgI && YTJ_State.bgActive) el.classList.add("overlaying");
@@ -1062,10 +1307,29 @@ class YTJ_AppClass extends Application {
           <span class="idx">${ii+1}.</span>
           <span class="t">${escapeHTML(t)}</span>
           <span class="m">${escapeHTML(it.id)}</span>
+          <button class="mini fav ${it.fav?'active':''}" title="Favorite"><i class="fas fa-star"></i></button>
           <button class="mini move" title="Move to..."><i class="fas fa-arrow-right"></i></button>
           <button class="mini trash" title="Remove"><i class="fas fa-times"></i></button>
         `;
         el.addEventListener("click",(ev)=>{ if (ev.target.closest(".mini")) return; YTJ_Control.select(gi,ii); });
+
+        // drag source events
+        el.addEventListener("dragstart", (e)=>{
+          el.classList.add("dragging");
+          e.dataTransfer.setData("text/plain", JSON.stringify({ fromG: gi, fromI: ii }));
+        });
+        el.addEventListener("dragend", ()=> el.classList.remove("dragging"));
+
+        // favoritos
+        el.querySelector(".fav").addEventListener("click", async (ev)=>{
+          ev.stopPropagation();
+          it.fav = !it.fav;
+          await YTJ_Library.save(true);
+          // atualiza estilo local sem re-render
+          ev.currentTarget.classList.toggle("active", it.fav);
+          // re-aplica filtro atual (caso esteja “Favorites only” ligado)
+          this.filterLibrary(YTJ_State.searchText, YTJ_State.favOnly);
+        });
 
         // remover
         el.querySelector(".trash").addEventListener("click", async (ev)=>{
@@ -1119,6 +1383,17 @@ class YTJ_AppClass extends Application {
         YTJ_Library.toggleCollapsed(gi); await YTJ_Library.save(true); YTJ_UI.refresh();
       });
 
+      // clear all
+      hdr.querySelector(".cleargrp").addEventListener("click", async ()=>{
+        if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can clear groups.");
+        if(!confirm(`Remove ALL tracks from "${grp.name}"?`)) return;
+        grp.items.length = 0;
+        await YTJ_Library.save(true);
+        if (gi===YTJ_State.g){ YTJ_Control.stop(); YTJ_State.g=-1; YTJ_State.i=-1; }
+        if (gi===YTJ_State.bgG){ YTJ_Control.stopOverlay(); }
+        YTJ_UI.refresh();
+      });
+
       // delete group
       hdr.querySelector(".delgrp").addEventListener("click", async ()=>{
         if(!YTJ_State.canEditLibrary()) return ui.notifications?.warn("Only GM can delete groups.");
@@ -1164,6 +1439,9 @@ class YTJ_AppClass extends Application {
         }, 0);
       }
     }
+
+    // aplica filtro atual (se havia texto/flag salvos) — sem perder foco
+    this.filterLibrary(YTJ_State.searchText, YTJ_State.favOnly);
   }
 }
 
