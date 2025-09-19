@@ -91,12 +91,26 @@ Hooks.once("init", () => {
     precedence: CONST.KEYBINDING_PRECEDENCE.NORMAL
   });
 
-  // NEW: hotkeys extras
-  game.keybindings.register(YTJ_ID, "playPause", {
-    name: "Play/Pause",
-    editable: [{key:"Space"}],
-    onDown: ()=>{ YTJ_State.paused ? YTJ_Control.playSelected() : YTJ_Control.pause(); return true; }
-  });
+game.keybindings.register(YTJ_ID, "playPause", {
+  name: "Play/Pause",
+  hint: "Toggle playback of the selected track in YouTube Jukebox",
+  editable: [
+    {
+      key: "Enter",        // tecla principal
+      modifiers: ["Shift"] // modificador
+    }
+  ],
+  onDown: () => {
+    if (YTJ_State.paused) {
+      YTJ_Control.playSelected();
+    } else {
+      YTJ_Control.pause();
+    }
+    return true;
+  },
+  restricted: false // se true, só GM pode usar
+});
+
   game.keybindings.register(YTJ_ID, "next", {
     name: "Next track",
     editable: [{key:"ArrowRight", modifiers:["SHIFT"]}],
