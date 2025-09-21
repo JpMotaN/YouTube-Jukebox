@@ -1334,16 +1334,44 @@ class YTJ_AppClass extends Application {
         });
         el.addEventListener("dragend", ()=> el.classList.remove("dragging"));
 
-        // favoritos
-        el.querySelector(".fav").addEventListener("click", async (ev)=>{
-          ev.stopPropagation();
-          it.fav = !it.fav;
-          await YTJ_Library.save(true);
-          // atualiza estilo local sem re-render
-          ev.currentTarget.classList.toggle("active", it.fav);
-          // re-aplica filtro atual (caso esteja “Favorites only” ligado)
-          this.filterLibrary(YTJ_State.searchText, YTJ_State.favOnly);
-        });
+   el.querySelector(".fav").addEventListener("click", async (ev) => {
+  ev.stopPropagation();
+  const btn = ev.currentTarget;
+
+  // evita cliques duplos durante o save
+  if (btn.dataset.busy === "1") return;
+  btn.dataset.busy = "1";
+
+  const prev = !!it.fav;
+  const next = !prev;
+
+  try {
+    // 1) UI imediata
+    it.fav = next;
+    btn.classList.toggle("active", next);
+
+    // 2) Se "Favorites only" estiver ativo, some/volte na hora
+    if (YTJ_State.favOnly) {
+      // some se desmarcou; garanta visível se marcou
+      el.style.display = next ? "" : "none";
+    }
+
+    // 3) Persiste (sem travar a UI)
+    await YTJ_Library.save(true);
+  } catch (e) {
+    // rollback em caso de erro
+    it.fav = prev;
+    btn.classList.toggle("active", prev);
+    if (YTJ_State.favOnly) {
+      el.style.display = prev ? "" : "none";
+    }
+    ui.notifications?.error("Failed to save favorites.");
+    console.error(e);
+  } finally {
+    btn.dataset.busy = "0";
+  }
+});
+
 
         // remover
         el.querySelector(".trash").addEventListener("click", async (ev)=>{

@@ -23,3 +23,26 @@ cursor: pointer;
 
 /* player visível para cumprir ToS: mantemos um iframe pequeno */
 .ytj-player { width: 320px; height: 180px; border:0; background:#000; }
+
+.ytj-item .mini.fav.active i { opacity: 1; }
+.ytj-item .mini.fav i { opacity: .7; }
+/* Botão de favorito (★) */
+.ytj-item .mini.fav {
+  background: transparent;            /* remove fundo cinza do mini */
+  border-color: var(--color-border-light-tertiary);
+  color: var(--ytj-fav-off, #a5a5a5); /* cor “apagada” */
+  transition: color .12s ease, transform .06s ease;
+}
+.ytj-item .mini.fav i {
+  pointer-events: none;               /* garante que o clique pegue no botão */
+}
+
+/* Estado ATIVO: dourado */
+.ytj-item .mini.fav.active {
+  color: var(--ytj-fav-on, #f6c644);  /* dourado */
+}
+
+/* Feedback tátil (leve “pop”) ao clicar */
+.ytj-item .mini.fav:active {
+  transform: scale(0.92);
+}
